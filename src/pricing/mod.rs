@@ -1,4 +1,14 @@
+//! Pricing resolution: user TOML rules → built-in rules → LiteLLM pricebook.
+//!
+//! Rules encode semantics LiteLLM can't express — free-in-CLI models priced
+//! at an equivalent public model (SWE-2 → kimi-k3). A rule may carry `as`
+//! (a LiteLLM key) to borrow current prices from the pricebook; its explicit
+//! `input`/`cached`/`output` numbers apply when the key isn't listed.
+
+pub mod litellm;
+
 use anyhow::{Context, Result};
+use litellm::LiteBook;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -17,10 +27,10 @@ pub struct Price {
 pub enum Pricing {
     /// Billed at `price`.
     Paid,
-    /// Free in Devin CLI — `price` is the equivalent list price of `billed_as`,
-    /// shown struck through; actual charge is $0.
-    Free { billed_as: String },
-    /// No pricing rule matched; shown as "?".
+    /// Free in the CLI — `price` is the equivalent list price, shown struck
+    /// through; actual charge is $0.
+    Free,
+    /// No price found anywhere; shown as "?".
     Unpriced,
 }
 
@@ -30,8 +40,8 @@ pub struct Rule {
     pub pattern: String,
     pub label: String,
     pub free: bool,
-    /// Human label for the model the price is borrowed from (free models only).
-    pub billed_as: Option<String>,
+    /// LiteLLM key whose current price this model borrows (free models).
+    pub priced_as: Option<String>,
     pub price: Option<Price>,
 }
 
@@ -39,18 +49,23 @@ pub struct Resolved {
     pub label: String,
     pub pricing: Pricing,
     pub price: Option<Price>,
+    /// Display label for the price source (litellm key, rule label, "list").
+    pub priced_as: String,
 }
 
 pub struct PriceBook {
     rules: Vec<Rule>,
+    litellm: LiteBook,
+    /// Provenance note for the report footer.
+    pub source_note: String,
 }
 
 /// Normalize a raw model name for matching: lowercase, runs of
 /// non-alphanumerics become a single '-'.
-/// "SWE-1.7 Max" -> "swe-1-7-max", "GPT-5.6 Sol High Thinking" -> "gpt-5-6-sol-high-thinking"
+/// "SWE-1.7 Max" -> "swe-1-7-max", "claude-opus-4-5-20251101" stays dashed.
 pub fn normalize(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
-    let mut last_dash = true; // trim leading
+    let mut last_dash = true;
     for c in name.chars() {
         if c.is_ascii_alphanumeric() {
             out.push(c.to_ascii_lowercase());
@@ -67,55 +82,70 @@ pub fn normalize(name: &str) -> String {
 }
 
 impl PriceBook {
-    pub fn new(extra: Vec<Rule>) -> Self {
+    pub fn new(extra: Vec<Rule>, litellm: LiteBook) -> Self {
         let mut rules = extra;
         rules.extend(default_rules());
-        Self { rules }
+        Self {
+            rules,
+            source_note: litellm.note.clone(),
+            litellm,
+        }
     }
 
     pub fn resolve(&self, raw_model: &str) -> Resolved {
         let norm = normalize(raw_model);
         for r in &self.rules {
-            if norm.contains(&r.pattern) {
-                return Resolved {
-                    label: r.label.clone(),
-                    pricing: if r.free {
-                        Pricing::Free {
-                            billed_as: r.billed_as.clone().unwrap_or_else(|| r.pattern.clone()),
-                        }
-                    } else {
-                        Pricing::Paid
-                    },
-                    price: r.price,
-                };
+            if !norm.contains(&r.pattern) {
+                continue;
             }
+            // `as` borrows the live LiteLLM price; explicit rule price is the
+            // declared equivalent when the key isn't listed.
+            let (price, as_label) = match &r.priced_as {
+                Some(k) => match self.litellm.lookup(&normalize(k)) {
+                    Some((key, p)) => (Some(p), key),
+                    None => (r.price, k.clone()),
+                },
+                None => (r.price, "list".to_string()),
+            };
+            return Resolved {
+                label: r.label.clone(),
+                pricing: if r.free { Pricing::Free } else { Pricing::Paid },
+                price,
+                priced_as: as_label,
+            };
+        }
+        if let Some((key, price)) = self.litellm.lookup(&norm) {
+            return Resolved {
+                label: raw_model.trim().to_string(),
+                pricing: Pricing::Paid,
+                price: Some(price),
+                priced_as: key,
+            };
         }
         Resolved {
             label: raw_model.trim().to_string(),
             pricing: Pricing::Unpriced,
             price: None,
+            priced_as: "?".into(),
         }
     }
 }
 
-/// Rules are matched in order — put specific patterns before generic ones.
-/// Prices are public API list prices (USD / 1M tokens), Sep 2026.
-///
-/// Cognition's SWE models are free inside Devin CLI but are priced here at
-/// the Moonshot models they are based on (SWE-1.7 -> kimi-k2.7-code,
-/// SWE-2 -> kimi-k3) so the "what would this have cost" figure is meaningful.
+/// Rules matched in order — specific patterns before generic ones. Explicit
+/// prices are public API list prices (USD / 1M tokens) used when the `as`
+/// key isn't in the LiteLLM book.
 fn default_rules() -> Vec<Rule> {
     let r = |pattern: &str,
              label: &str,
              free: bool,
-             billed_as: Option<&str>,
+             priced_as: Option<&str>,
              i: f64,
              c: f64,
              o: f64| Rule {
         pattern: normalize(pattern),
         label: label.to_string(),
         free,
-        billed_as: billed_as.map(|s| s.to_string()),
+        priced_as: priced_as.map(|s| s.to_string()),
         price: Some(Price {
             input: i,
             cached: c,
@@ -123,7 +153,7 @@ fn default_rules() -> Vec<Rule> {
         }),
     };
     vec![
-        // --- Cognition (free in Devin CLI), priced at equivalent list rates ---
+        // --- Cognition (free in Devin CLI), priced at Moonshot equivalents ---
         r(
             "swe-1-7",
             "SWE-1.7",
@@ -147,7 +177,7 @@ fn default_rules() -> Vec<Rule> {
             "adaptive",
             "Adaptive",
             true,
-            Some("kimi-k3 est."),
+            Some("kimi-k3"),
             3.00,
             0.30,
             15.00,
@@ -156,12 +186,12 @@ fn default_rules() -> Vec<Rule> {
             "fusion",
             "Fusion",
             true,
-            Some("fable-5.1 est."),
+            Some("claude-fable-5-1"),
             10.00,
             0.25,
             50.00,
         ),
-        // --- OpenAI ---
+        // --- Devin CLI display names (also priced by LiteLLM if present) ---
         r(
             "gpt-6-astra",
             "GPT-6 Astra",
@@ -190,100 +220,15 @@ fn default_rules() -> Vec<Rule> {
             0.02,
             1.20,
         ),
-        r("gpt-5-6", "GPT-5.6", false, None, 4.00, 0.40, 20.00),
-        r("gpt-5", "GPT-5", false, None, 2.00, 0.20, 12.00),
-        // --- Anthropic ---
-        r(
-            "claude-fable",
-            "Claude Fable",
-            false,
-            None,
-            10.00,
-            0.25,
-            50.00,
-        ),
-        r(
-            "claude-opus-5",
-            "Claude Opus 5",
-            false,
-            None,
-            5.00,
-            0.50,
-            25.00,
-        ),
-        r("claude-opus", "Claude Opus", false, None, 5.00, 0.50, 25.00),
-        r(
-            "claude-sonnet-5",
-            "Claude Sonnet 5",
-            false,
-            None,
-            2.00,
-            0.20,
-            10.00,
-        ),
-        r(
-            "claude-sonnet",
-            "Claude Sonnet",
-            false,
-            None,
-            3.00,
-            0.30,
-            15.00,
-        ),
-        r(
-            "claude-haiku",
-            "Claude Haiku",
-            false,
-            None,
-            1.00,
-            0.10,
-            5.00,
-        ),
-        // --- Google ---
-        r(
-            "gemini-3-pro",
-            "Gemini 3 Pro",
-            false,
-            None,
-            2.00,
-            0.20,
-            12.00,
-        ),
-        r(
-            "gemini-3-5-flash",
-            "Gemini 3.5 Flash",
-            false,
-            None,
-            1.50,
-            0.15,
-            7.50,
-        ),
-        r(
-            "gemini-3-flash",
-            "Gemini 3 Flash",
-            false,
-            None,
-            1.50,
-            0.15,
-            7.50,
-        ),
-        // open models offered free inside Devin CLI; no public equivalent price
+        // open models offered free inside Devin CLI; no public equivalent
         Rule {
             pattern: normalize("penguin"),
             label: "Penguin".into(),
             free: true,
-            billed_as: None,
+            priced_as: None,
             price: None,
         },
-        // --- Z.ai (free in Devin CLI) ---
         r("glm-5", "GLM-5", true, Some("glm-5"), 1.40, 0.26, 4.40),
-        // --- Moonshot (direct usage) ---
-        r("kimi-k3", "Kimi K3", false, None, 3.00, 0.30, 15.00),
-        r("kimi-k2-7", "Kimi K2.7 Code", false, None, 0.95, 0.19, 4.00),
-        r("kimi-k2-6", "Kimi K2.6", false, None, 0.95, 0.16, 4.00),
-        r("kimi", "Kimi", false, None, 0.60, 0.10, 2.50),
-        // --- DeepSeek ---
-        r("deepseek", "DeepSeek", false, None, 0.28, 0.03, 0.42),
     ]
 }
 
@@ -298,7 +243,9 @@ struct RuleToml {
     label: Option<String>,
     #[serde(default)]
     free: bool,
-    billed_as: Option<String>,
+    /// LiteLLM key to borrow prices from.
+    #[serde(rename = "as")]
+    priced_as: Option<String>,
     /// USD per 1M uncached input tokens.
     input: Option<f64>,
     /// USD per 1M cached input tokens (defaults to `input`).
@@ -320,7 +267,7 @@ pub fn load_rules(path: &Path) -> Result<Vec<Rule>> {
             pattern: normalize(&r.pattern),
             label: r.label.unwrap_or_else(|| r.pattern.clone()),
             free: r.free,
-            billed_as: r.billed_as,
+            priced_as: r.priced_as,
             price: r.input.map(|input| Price {
                 input,
                 cached: r.cached.unwrap_or(input),
@@ -333,10 +280,10 @@ pub fn load_rules(path: &Path) -> Result<Vec<Rule>> {
 pub fn default_config_path() -> std::path::PathBuf {
     std::env::home_dir()
         .unwrap_or_default()
-        .join(".config/devin-tokenviz.toml")
+        .join(".config/llmstat.toml")
 }
 
-/// Load `~/.config/devin-tokenviz.toml` if it exists.
+/// Load `~/.config/llmstat.toml` if it exists.
 pub fn load_default_rules() -> Vec<Rule> {
     let p = default_config_path();
     if p.exists() {

@@ -1,19 +1,17 @@
 //! Read per-call usage out of Devin's `sessions.db` (SQLite via rusqlite).
 //!
-//! Transcripts only serialize the *current* chain of a session; resumed,
-//! compacted or forked chains — and subagent sessions, which never get a
-//! transcript — live on in the `message_nodes` table. Every message node
-//! carries `metadata.num_tokens_preceding`, which equals the exact
-//! `prompt_tokens` of the inference call that produced it (verified against
-//! `response_dimensions` and transcript `metrics` — they agree to the token).
-//!
-//! The same logical message is stored twice per node (with/without metadata),
-//! so calls are deduped by `message_id`, keeping the max `num_tokens_preceding`.
+//! Every message node carries `metadata.num_tokens_preceding`, which equals
+//! the exact `prompt_tokens` of the inference call that produced it
+//! (verified against `response_dimensions` and transcript `metrics` — they
+//! agree to the token). The same logical message is stored twice per node
+//! (with/without metadata), so calls are deduped by `message_id`, keeping
+//! the max `num_tokens_preceding`.
 //!
 //! Rows are insert-only, so matched rows are cached on disk and each run
 //! scans just the `row_id` tail beyond the cached high-water mark.
 
 use anyhow::{Context, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -21,7 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::cache;
+use super::cache;
+
+const SCAN_SQL: &str = include_str!("message_nodes.sql");
 
 /// One inference call recovered from the sessions.db message tree.
 #[derive(Debug)]
@@ -50,12 +50,6 @@ pub struct DbData {
     pub session_models: HashMap<String, String>,
     /// Inference calls deduped by message_id.
     pub calls: Vec<DbCall>,
-}
-
-pub fn default_db_path() -> PathBuf {
-    std::env::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".local/share/devin/cli/sessions.db")
 }
 
 /// Sequentially read the db + wal into the OS page cache on background
@@ -94,26 +88,9 @@ fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// chat_message is compact JSON with a fixed key order:
-///   {"message_id":"<36-byte uuid>","role":"assistant",...
-/// Both invariants are anchored with cheap byte-prefix checks instead of
-/// json_extract on the multi-KB blob (which would pull every overflow
-/// page). Verified over the whole table: the filters match exactly the
-/// rows where json_extract($.role) = 'assistant', and substr(16,36)
-/// equals $.message_id for every one of them. If Devin ever changes the
-/// serialization, rows are missed — never merged.
 fn scan_range(path: &Path, lo: i64, hi: i64) -> Result<Vec<RawRow>> {
     let conn = open(path)?;
-    let mut st = conn.prepare(
-        "SELECT row_id, session_id,
-                substr(chat_message, 16, 36),
-                COALESCE(json_extract(metadata, '$.num_tokens_preceding'), 0),
-                created_at
-         FROM message_nodes
-         WHERE row_id >= ?1 AND row_id < ?2
-           AND substr(chat_message, 1, 15) = '{\"message_id\":\"'
-           AND substr(chat_message, 1, 120) LIKE '%\"role\":\"assistant\"%'",
-    )?;
+    let mut st = conn.prepare(SCAN_SQL)?;
     let rs = st.query_map([lo, hi], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -135,6 +112,18 @@ fn scan_range(path: &Path, lo: i64, hi: i64) -> Result<Vec<RawRow>> {
         });
     }
     Ok(out)
+}
+
+fn workers() -> usize {
+    std::env::var("LLMSTAT_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(4)
+        })
+        .max(1)
 }
 
 pub fn load(path: &Path) -> Result<DbData> {
@@ -170,20 +159,22 @@ pub fn load(path: &Path) -> Result<DbData> {
 
         // Split [start, cur_max] over several read-only connections — WAL
         // mode allows concurrent readers, and each worker's B-tree range
-        // scan reads disjoint page runs. The per-row work (record decode +
-        // json_extract on metadata) is the real CPU cost and splits across
-        // cores; the byte-prefix filters are already memcmp-cheap.
-        let workers: usize = std::env::var("TVIZ_WORKERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get().min(8))
-                    .unwrap_or(4)
-            });
+        // scan reads disjoint page runs.
         let span = cur_max - start + 1;
-        let workers = if span < 20_000 { 1 } else { workers.max(1) };
+        let workers = if span < 20_000 { 1 } else { workers() };
         let chunk = (span + workers as i64 - 1) / workers as i64;
+
+        // Only worth a spinner for a real (multi-second) scan; a cache-hit
+        // tail finishes before the first frame would draw.
+        let pb = (span >= 50_000).then(|| {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {msg}").expect("static template"),
+            );
+            pb.set_message(format!("scanning {}", path.display()));
+            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+            pb
+        });
 
         let t0 = std::time::Instant::now();
         let mut parts: Vec<Result<Vec<RawRow>>> = Vec::new();
@@ -198,11 +189,15 @@ pub fn load(path: &Path) -> Result<DbData> {
                 handles.push(s.spawn(move || scan_range(path, lo, hi)));
             }
             for h in handles {
-                parts.push(h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("panic"))));
+                parts.push(
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("scan panicked"))),
+                );
             }
         });
-        if std::env::var_os("TVIZ_DEBUG").is_some() {
-            eprintln!("[t] scan {workers}w -> {:?}", t0.elapsed());
+        tracing::debug!(workers, elapsed = ?t0.elapsed(), "message_nodes scan");
+        if let Some(pb) = pb {
+            pb.finish_and_clear();
         }
         for p in parts {
             rows.extend(p?);

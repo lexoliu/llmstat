@@ -1,8 +1,8 @@
 use std::io::IsTerminal;
 
-use crate::data::{Report, Usage};
 use crate::fmt;
 use crate::pricing::Pricing;
+use crate::report::{Report, Usage};
 
 /// ANSI styling, disabled when stdout is not a terminal or NO_COLOR is set.
 #[derive(Clone, Copy)]
@@ -126,7 +126,7 @@ fn cost_cells(
     wa: usize,
 ) -> (String, String) {
     match (pricing, list) {
-        (Pricing::Free { .. }, Some(c)) => (
+        (Pricing::Free, Some(c)) => (
             pad_st(p, &fmt::money(c), wl, true, |p, s| p.waived(s)),
             pad_st(p, "$0.00", wa, true, |p, s| p.free(s)),
         ),
@@ -137,7 +137,7 @@ fn cost_cells(
                 pad_st(p, &m, wa, true, |p, s| p.money(s)),
             )
         }
-        (Pricing::Free { .. }, None) => (
+        (Pricing::Free, None) => (
             pad_st(p, "?", wl, true, |p, s| p.dim(s)),
             pad_st(p, "$0.00", wa, true, |p, s| p.free(s)),
         ),
@@ -168,31 +168,24 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
     // ── header ──────────────────────────────────────────────────────────
     o.push_str(&format!(
         "{}\n",
-        p.bold(format!("devin-tokenviz · {range_desc} · {range}"))
+        p.bold(format!("llmstat · {range_desc} · {range}"))
     ));
+    for w in &r.warnings {
+        o.push_str(&format!("{}\n", p.st(format!("warning: {w}"), "31")));
+    }
     o.push_str(&format!(
         "{} sessions · {} calls · {} tokens\n",
         r.sessions.len(),
-        r.total_steps,
+        fmt::int(r.total_calls),
         p.bold(fmt::tokens(r.total.total()))
     ));
-    if r.db_used {
+    for note in &r.coverage {
+        o.push_str(&format!("{}\n", p.dim(note)));
+    }
+    if r.has_estimated {
         o.push_str(&format!(
             "{}\n",
-            p.dim(format!(
-                "coverage: {} transcripts · +{} calls ({} tok) recovered from sessions.db — resumed chains & subagent runs",
-                r.files_read,
-                r.db_recovered_calls,
-                fmt::tokens(r.db_recovered_tokens),
-            ))
-        ));
-    } else {
-        o.push_str(&format!(
-            "{}\n",
-            p.dim(format!(
-                "coverage: {} transcripts — resumed chains & subagent runs not counted",
-                r.files_read
-            ))
+            p.dim("recovered calls' cached/output splits are estimated")
         ));
     }
     o.push_str(&format!(
@@ -223,6 +216,10 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
     // ── by model ────────────────────────────────────────────────────────
     o.push_str(&hr(p, "by model"));
     o.push('\n');
+    let multi_src = r
+        .models
+        .first()
+        .is_some_and(|f| r.models.iter().any(|m| m.source != f.source));
     let lw = r
         .models
         .iter()
@@ -233,19 +230,17 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
     let pw = r
         .models
         .iter()
-        .map(|m| match &m.pricing {
-            Pricing::Free { billed_as } => billed_as.len() + 2,
-            _ => 4,
-        })
+        .map(|m| m.priced_as.len() + 2)
         .max()
         .unwrap_or(4)
-        .clamp(4, 20);
+        .clamp(4, 22);
     let tw = terminal_size::terminal_size()
         .map(|(w, _)| w.0 as usize)
         .or_else(|| std::env::var("COLUMNS").ok()?.parse().ok())
         .unwrap_or(120);
     // full = show in/cached/out columns; dist bar uses whatever width is left
-    let base_w = 2 + lw + 8 + 7 + pw + 22; // without in/cached/out or dist
+    let src_w = if multi_src { 8 } else { 0 };
+    let base_w = 2 + src_w + lw + 8 + 7 + pw + 22; // without in/cached/out or dist
     let full = base_w + 27 + 16 <= tw;
     let dist_w = if full {
         14
@@ -255,13 +250,17 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
     let show_dist = dist_w >= 6;
 
     {
-        let mut h = format!(
+        let mut h = String::new();
+        if multi_src {
+            h.push_str(&format!(" {:<6}", p.bold("SRC")));
+        }
+        h.push_str(&format!(
             " {:<lw$} {:>7} {:>6}",
             p.bold("MODEL"),
             p.bold("TOTAL"),
             p.bold("SHARE"),
             lw = lw
-        );
+        ));
         if full {
             h.push_str(&format!(
                 " {:>8} {:>8} {:>8}",
@@ -287,20 +286,25 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
     let grand = r.total.total().max(1);
     let max_t = r.models.iter().map(|m| m.usage.total()).max().unwrap_or(1);
     for m in &r.models {
-        let priced_as = match &m.pricing {
-            Pricing::Free { billed_as } if m.price.is_some() => format!("{billed_as} *"),
-            Pricing::Free { .. } => "n/a *".into(),
-            Pricing::Paid => "list".into(),
-            Pricing::Unpriced => "?".into(),
+        let priced_as = match m.pricing {
+            Pricing::Free => format!("{} *", m.priced_as),
+            _ => m.priced_as.clone(),
         };
         let (list, actual) = cost_cells(p, &m.pricing, m.list_cost(), 10, 9);
-        let mut row = format!(
+        let mut row = String::new();
+        if multi_src {
+            row.push_str(&format!(
+                " {}",
+                pad_st(p, m.source, 6, false, |p, s| p.dim(s))
+            ));
+        }
+        row.push_str(&format!(
             " {:<lw$} {:>7} {:>5.1}%",
             m.label,
             fmt::tokens(m.usage.total()),
             m.usage.total() as f64 / grand as f64 * 100.0,
             lw = lw
-        );
+        ));
         if full {
             row.push_str(&format!(
                 " {:>8} {:>8} {:>8}",
@@ -324,7 +328,7 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
     }
     o.push_str(&format!(
         "{}\n",
-        p.dim(" * free in Devin CLI — struck list price, actual $0.00")
+        p.dim(" * free in the CLI — struck list price, actual $0.00")
     ));
     o.push('\n');
 
@@ -404,16 +408,7 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
     }
     if r.has_unpriced {
         o.push_str(&p.dim(
-            "note: unpriced models excluded from costs — add [[rule]] via --pricing or ~/.config/devin-tokenviz.toml\n",
-        ));
-    }
-    if r.files_failed > 0 {
-        o.push_str(&format!(
-            "{}\n",
-            p.st(
-                format!("warning: {} transcript(s) failed to parse", r.files_failed),
-                "31"
-            )
+            "note: unpriced models excluded from costs — add [[rule]] via --pricing or ~/.config/llmstat.toml\n",
         ));
     }
     o

@@ -1,3 +1,16 @@
+/// Grouped integer: 26815 -> "26,815".
+pub fn int(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Human-readable token count: 123 -> "123", 12_345 -> "12.3K", 152_400_000 -> "152.4M"
 pub fn tokens(n: u64) -> String {
     const UNITS: [(f64, &str); 3] = [(1e9, "B"), (1e6, "M"), (1e3, "K")];
