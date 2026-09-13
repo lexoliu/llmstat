@@ -3,6 +3,7 @@
 pub mod claude;
 pub mod codex;
 pub mod devin;
+pub mod filecache;
 
 use crate::report::Call;
 

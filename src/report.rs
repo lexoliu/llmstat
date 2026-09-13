@@ -8,7 +8,7 @@ use crate::pricing::{Price, PriceBook, Pricing};
 
 /// Token usage for a single call or aggregate. `input` is the *uncached*
 /// portion of prompt tokens; `cached` is the cache-hit subset.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
     pub input: u64,
     pub cached: u64,
