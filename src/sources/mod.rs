@@ -17,6 +17,12 @@ pub struct SourceOut {
     pub note: String,
 }
 
+/// A prompt or title turned into a single-line session name: whitespace
+/// collapsed, capped at 20 words.
+pub fn titleize(s: &str) -> String {
+    s.split_whitespace().take(20).collect::<Vec<_>>().join(" ")
+}
+
 /// The closed set of source scanners for `monitor` mode — one variant per
 /// CLI, each holding whatever state its incremental format needs.
 pub enum AnyScanner {

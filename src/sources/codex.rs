@@ -38,6 +38,9 @@ struct Payload {
     session_id: Option<String>,
     /// `user_message` events carry the prompt text — the session's title.
     message: Option<String>,
+    /// `response_item` user messages: role + structured content parts.
+    role: Option<String>,
+    content: Option<serde_json::Value>,
     /// `session_meta`/`turn_context` carry the working directory.
     cwd: Option<String>,
     info: Option<Info>,
@@ -97,6 +100,15 @@ pub struct Codex;
 /// Calls parsed from a file region (dict indices into the entry's dict).
 type Entries = Vec<CachedCall>;
 
+/// Record a candidate session name from prompt text: injected context
+/// (`<xml>` blocks, `#`-prefixed instructions) is not a user prompt.
+fn set_name(state: &mut State, text: &str) {
+    let t = super::titleize(text);
+    if !t.is_empty() && !t.starts_with('<') && !t.starts_with('#') {
+        state.name.get_or_insert(t);
+    }
+}
+
 /// Parse `path` starting at `offset` with `state`, extending `dict`.
 /// Returns (consumed bytes, final state, dict, new tail entries).
 fn parse_file(
@@ -116,6 +128,7 @@ fn parse_file(
                 && !line.contains("token_count")
                 && !line.contains("session_meta")
                 && !line.contains("user_message")
+                && !line.contains("response_item")
             {
                 return;
             }
@@ -139,12 +152,26 @@ fn parse_file(
                 }
                 Some("event_msg") if p.kind.as_deref() == Some("user_message") => {
                     if let Some(m) = &p.message {
-                        // first line of the first real prompt, whitespace-collapsed
-                        let title: String =
-                            m.split_whitespace().take(20).collect::<Vec<_>>().join(" ");
-                        if !title.is_empty() && !title.starts_with('<') {
-                            state.name.get_or_insert(title);
-                        }
+                        set_name(&mut state, m);
+                    }
+                }
+                // newer rollouts log user input as response_items; injected
+                // context (`<recommended_plugins>`, `# AGENTS.md`) is skipped
+                // so the name is the first real prompt.
+                Some("response_item")
+                    if p.kind.as_deref() == Some("message")
+                        && p.role.as_deref() == Some("user")
+                        && state.name.is_none() =>
+                {
+                    let text = match &p.content {
+                        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+                        Some(serde_json::Value::Array(items)) => items
+                            .iter()
+                            .find_map(|it| it.get("text").and_then(|t| t.as_str())),
+                        _ => None,
+                    };
+                    if let Some(t) = text {
+                        set_name(&mut state, t);
                     }
                 }
                 Some("event_msg") if p.kind.as_deref() == Some("token_count") => {

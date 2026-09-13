@@ -20,7 +20,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::report::{Call, Usage};
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const PROBE: usize = 64;
 
 /// 128-bit dedup key. Sources hash their identifying parts — a false

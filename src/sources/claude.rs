@@ -32,9 +32,15 @@ struct Line {
     session_id: Option<String>,
     /// Human-readable session slug, present on many record types.
     slug: Option<String>,
-    /// Generated session title on `agent-name` records.
+    /// Generated session title on `ai-title` records.
+    #[serde(rename = "aiTitle")]
+    ai_title: Option<String>,
+    /// Task title on `agent-name` records.
     #[serde(rename = "agentName")]
     agent_name: Option<String>,
+    /// Sidechain records belong to subagents, not the session's task.
+    #[serde(rename = "isSidechain")]
+    is_sidechain: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -42,6 +48,9 @@ struct Msg {
     id: Option<String>,
     model: Option<String>,
     usage: Option<U>,
+    /// `user` records carry the prompt in `message.content` — a string for
+    /// real prompts, an array for tool results.
+    content: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -69,10 +78,12 @@ pub struct Claude;
 /// discovered on non-assistant records, possibly after calls were emitted.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct State {
-    /// `slug` — the canonical session name.
-    slug: Option<String>,
-    /// `agentName` on `agent-name` records — a generated task title.
+    /// `aiTitle`/`agentName` — a generated task title.
     title: Option<String>,
+    /// First real user prompt — next best name.
+    prompt: Option<String>,
+    /// `slug` — generated word-triplet, still better than a uuid.
+    slug: Option<String>,
 }
 
 /// Parse `path` from `offset`, extending `dict` with new strings. Returns
@@ -98,17 +109,30 @@ fn parse_file(
             if !line.contains("\"assistant\"")
                 && !line.contains("slug")
                 && !line.contains("agent-name")
+                && !line.contains("ai-title")
+                && !line.contains("\"type\":\"user\"")
             {
                 return;
             }
             let Ok(l) = serde_json::from_str::<Line>(line) else {
                 return;
             };
+            if let Some(t) = l.ai_title.or(l.agent_name) {
+                state.title.get_or_insert(t);
+            }
             if let Some(s) = l.slug {
                 state.slug.get_or_insert(s);
             }
-            if let Some(t) = l.agent_name {
-                state.title.get_or_insert(t);
+            if l.kind.as_deref() == Some("user")
+                && state.prompt.is_none()
+                && l.is_sidechain != Some(true)
+                && let Some(m) = &l.message
+                && let Some(serde_json::Value::String(s)) = &m.content
+            {
+                let t = super::titleize(s);
+                if !t.is_empty() && !t.starts_with('<') {
+                    state.prompt = Some(t);
+                }
             }
             if l.kind.as_deref() != Some("assistant") {
                 return;
@@ -180,9 +204,16 @@ impl Jsonl for Claude {
     }
 
     /// The session name may be discovered after calls were parsed — stamp
-    /// it onto every entry once the file tail is in.
+    /// it onto every entry once the file tail is in. Priority: generated
+    /// title, then first user prompt, then the word-triplet slug.
     fn fixup(e: &mut Entry<State>) {
-        let Some(name) = e.state.title.as_ref().or(e.state.slug.as_ref()) else {
+        let Some(name) = e
+            .state
+            .title
+            .as_ref()
+            .or(e.state.prompt.as_ref())
+            .or(e.state.slug.as_ref())
+        else {
             return;
         };
         let i = filecache::dict_get_or_push(&mut e.dict, name);
