@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,14 +42,6 @@ pub struct RawRow {
     /// num_tokens_preceding, 0 when the node recorded none.
     pub ntp: u64,
     pub ts: i64,
-}
-
-#[derive(Debug, Default)]
-pub struct DbData {
-    /// session id -> model recorded on the session row (may be empty).
-    pub session_models: HashMap<String, String>,
-    /// Inference calls deduped by message_id.
-    pub calls: Vec<DbCall>,
 }
 
 /// Sequentially read the db + wal into the OS page cache on background
@@ -126,41 +118,81 @@ fn workers() -> usize {
         .max(1)
 }
 
-pub fn load(path: &Path, mp: &MultiProgress) -> Result<DbData> {
-    let conn = open(path)?;
+/// Stateful scanner holding the db connection open: `tick` probes
+/// `max(row_id)` and range-scans only the unseen tail, so a `live` poll is
+/// a sub-millisecond B-tree descent when idle. The first tick is the full
+/// incremental scan (disk cache + parallel ranges), same as a one-shot run.
+pub struct Scanner {
+    conn: Connection,
+    path: PathBuf,
+    /// First row_id not yet scanned.
+    next_rowid: i64,
+    /// All matched rows — persisted to the incremental cache on change.
+    rows: Vec<RawRow>,
+    /// (session, mid) -> (max ntp, earliest ts) dedup over `rows`.
+    best: HashMap<(String, String), (u64, i64)>,
+    /// (session, mid) pairs already emitted as calls.
+    emitted: HashSet<(String, String)>,
+    /// session id -> model recorded on the session row (may be empty).
+    pub session_models: HashMap<String, String>,
+}
 
-    let mut session_models = HashMap::new();
-    {
-        let mut st = conn.prepare("SELECT id, COALESCE(model,'') FROM sessions")?;
-        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        for r in rows {
-            let (id, m) = r?;
-            session_models.insert(id, m);
-        }
+fn session_models(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    let mut st = conn.prepare("SELECT id, COALESCE(model,'') FROM sessions")?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for r in rows {
+        let (id, m) = r?;
+        out.insert(id, m);
     }
+    Ok(out)
+}
 
-    let cur_max: i64 = conn.query_row(
+fn max_rowid(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
         "SELECT COALESCE(MAX(row_id), 0) FROM message_nodes",
         [],
         |r| r.get(0),
-    )?;
+    )?)
+}
 
-    // Resume from the incremental cache when possible.
-    let (mut rows, start) = match cache::load(path, cur_max) {
-        Some((max_rowid, cached)) => (cached, max_rowid + 1),
-        None => (Vec::new(), 0),
-    };
+impl Scanner {
+    /// Open the db, load the incremental cache, prime the dedup map. The
+    /// first `tick` scans whatever tail the cache doesn't cover.
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = open(path)?;
+        let models = session_models(&conn)?;
+        let cur_max = max_rowid(&conn)?;
+        let (rows, next_rowid) = match cache::load(path, cur_max) {
+            Some((max_rowid, cached)) => (cached, max_rowid + 1),
+            None => (Vec::new(), 0),
+        };
+        let mut best = HashMap::with_capacity(rows.len());
+        for r in &rows {
+            let e = best
+                .entry((r.session.clone(), r.mid.clone()))
+                .or_insert((0, i64::MAX));
+            e.0 = e.0.max(r.ntp);
+            e.1 = e.1.min(r.ts);
+        }
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+            next_rowid,
+            rows,
+            best,
+            emitted: HashSet::new(),
+            session_models: models,
+        })
+    }
 
-    if start <= cur_max {
-        // Estimate the byte offset of row `start` (row_ids grow roughly
-        // linearly with file bytes) and warm the page cache from there.
-        let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let stop = prefetch(path, file_len * start as u64 / (cur_max as u64 + 1));
+    /// Range-scan [lo, hi) over `workers` parallel read-only connections,
+    /// prefetching the file tail into the OS page cache first.
+    fn scan(&self, lo: i64, hi: i64, mp: &MultiProgress) -> Result<Vec<RawRow>> {
+        let file_len = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        let stop = prefetch(&self.path, file_len * lo as u64 / (hi as u64 + 1));
 
-        // Split [start, cur_max] over several read-only connections — WAL
-        // mode allows concurrent readers, and each worker's B-tree range
-        // scan reads disjoint page runs.
-        let span = cur_max - start + 1;
+        let span = hi - lo;
         let workers = if span < 20_000 { 1 } else { workers() };
         let chunk = (span + workers as i64 - 1) / workers as i64;
 
@@ -171,22 +203,23 @@ pub fn load(path: &Path, mp: &MultiProgress) -> Result<DbData> {
             pb.set_style(
                 ProgressStyle::with_template("{spinner:.cyan} {msg}").expect("static template"),
             );
-            pb.set_message(format!("scanning {}", path.display()));
+            pb.set_message(format!("scanning {}", self.path.display()));
             pb.enable_steady_tick(std::time::Duration::from_millis(80));
             pb
         });
 
         let t0 = std::time::Instant::now();
         let mut parts: Vec<Result<Vec<RawRow>>> = Vec::new();
+        let path = &self.path;
         std::thread::scope(|s| {
             let mut handles = Vec::new();
             for w in 0..workers {
-                let lo = start + w as i64 * chunk;
-                let hi = (lo + chunk).min(cur_max + 1);
-                if lo >= hi {
+                let wlo = lo + w as i64 * chunk;
+                let whi = (wlo + chunk).min(hi);
+                if wlo >= whi {
                     break;
                 }
-                handles.push(s.spawn(move || scan_range(path, lo, hi)));
+                handles.push(s.spawn(move || scan_range(path, wlo, whi)));
             }
             for h in handles {
                 parts.push(
@@ -199,32 +232,45 @@ pub fn load(path: &Path, mp: &MultiProgress) -> Result<DbData> {
         if let Some(pb) = pb {
             pb.finish_and_clear();
         }
-        for p in parts {
-            rows.extend(p?);
-        }
         stop.store(true, Ordering::Relaxed);
-        cache::save(path, cur_max, &rows);
+        let mut out = Vec::new();
+        for p in parts {
+            out.extend(p?);
+        }
+        Ok(out)
     }
 
-    // Dedup by (session, message_id): keep the max token count (metadata
-    // and metadata-less copies of the same node pair) and earliest time.
-    let mut best: HashMap<(String, String), (u64, i64)> = HashMap::new();
-    for r in rows {
-        let e = best.entry((r.session, r.mid)).or_insert((0, i64::MAX));
-        e.0 = e.0.max(r.ntp);
-        e.1 = e.1.min(r.ts);
+    /// Probe the high-water mark; on growth, scan the tail and return calls
+    /// whose (session, mid) first reached a nonzero token count. A node
+    /// pair whose metadata copy lands in a later tick emits then — same
+    /// totals as a one-shot run.
+    pub fn tick(&mut self, mp: &MultiProgress) -> Result<Vec<DbCall>> {
+        let cur_max = max_rowid(&self.conn)?;
+        let mut out = Vec::new();
+        if cur_max < self.next_rowid {
+            return Ok(out);
+        }
+        let new_rows = self.scan(self.next_rowid, cur_max + 1, mp)?;
+        self.next_rowid = cur_max + 1;
+        for r in new_rows {
+            let key = (r.session.clone(), r.mid.clone());
+            let e = self.best.entry(key.clone()).or_insert((0, i64::MAX));
+            e.0 = e.0.max(r.ntp);
+            e.1 = e.1.min(r.ts);
+            // Emit once a mid first shows a nonzero count — rows recorded
+            // without metadata (ntp=0) never produce a call, matching the
+            // one-shot path's `prompt == 0` skip.
+            if e.0 > 0 && self.emitted.insert(key) {
+                out.push(DbCall {
+                    session: r.session.clone(),
+                    ts: e.1,
+                    prompt: e.0,
+                });
+            }
+            self.rows.push(r);
+        }
+        self.session_models = session_models(&self.conn)?;
+        cache::save(&self.path, cur_max, &self.rows);
+        Ok(out)
     }
-    let calls = best
-        .into_iter()
-        .map(|((session, _), (prompt, ts))| DbCall {
-            session,
-            ts,
-            prompt,
-        })
-        .collect();
-
-    Ok(DbData {
-        session_models,
-        calls,
-    })
 }

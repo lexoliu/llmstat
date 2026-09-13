@@ -11,16 +11,13 @@
 
 use anyhow::Result;
 use chrono::DateTime;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use rayon::prelude::*;
+use indicatif::MultiProgress;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::report::Usage;
 use crate::sources::SourceOut;
-use crate::sources::filecache::{self, CachedCall, Dict, Entry, Plan};
+use crate::sources::filecache::{self, CachedCall, Dict, Jsonl};
 
 #[derive(Deserialize)]
 struct Line {
@@ -59,6 +56,9 @@ pub fn default_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("~"))
         .join(".claude/projects")
 }
+
+/// Claude Code's JSONL shape — no parser state to carry across resumes.
+pub struct Claude;
 
 /// Parse `path` from `offset`, extending `dict` with new strings. Returns
 /// (consumed bytes, dict, new tail entries).
@@ -135,169 +135,60 @@ fn parse_file(
     Ok((consumed, dict.into_strings(), entries))
 }
 
-/// What the scan produced for one file.
-enum Outcome {
-    Reuse,
-    /// Parsed from `offset`; `entries` are only the new tail.
-    Resumed(u64, Vec<String>, Vec<CachedCall>),
-    /// Parsed from 0; `entries` replace any cached ones.
-    Full(u64, Vec<String>, Vec<CachedCall>),
+impl Jsonl for Claude {
+    type State = ();
+    const SOURCE: &'static str = "claude";
+
+    fn fresh(_path: &Path) {}
+
+    fn parse(
+        path: &Path,
+        offset: u64,
+        (): (),
+        dict: Vec<String>,
+    ) -> std::io::Result<(u64, (), Vec<String>, Vec<CachedCall>)> {
+        parse_file(path, offset, dict).map(|(c, d, e)| (c, (), d, e))
+    }
 }
 
-pub fn load(dir: &Path, mp: &MultiProgress) -> Result<SourceOut> {
-    let t0 = std::time::Instant::now();
-    let scope = [dir];
-    let mut cache: HashMap<PathBuf, Entry<()>> = filecache::load("claude-files", &scope);
+/// Live-capable scanner: first `tick` is the full incremental scan, later
+/// ticks emit only newly appended calls.
+pub type Scanner = filecache::Scanner<Claude>;
 
-    let files: Vec<(PathBuf, u64)> = walkdir::WalkDir::new(dir)
+/// `*.jsonl` under `dir`, as (path, len).
+pub fn walk(dir: &Path) -> Vec<(PathBuf, u64)> {
+    walkdir::WalkDir::new(dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
         .filter_map(|e| e.metadata().ok().map(|m| (e.into_path(), m.len())))
-        .collect();
+        .collect()
+}
 
-    // Phase 1: classify every file (stat + probe only — no parsing).
-    let planned: Vec<(PathBuf, u64, Plan<()>)> = files
-        .par_iter()
-        .map(|(path, len)| {
-            (
-                path.clone(),
-                *len,
-                filecache::plan(path, *len, cache.get(path)),
-            )
-        })
-        .collect();
-    let todo_bytes: u64 = planned
-        .iter()
-        .map(|(_, len, p)| filecache::plan_bytes(*len, p))
-        .sum();
-
-    // Phase 2: parse what needs parsing, with a progress bar when the work
-    // is big enough to feel (cold scans read gigabytes).
-    let pb = (todo_bytes >= filecache::BAR_MIN_BYTES).then(|| {
-        let pb = mp.add(ProgressBar::new(todo_bytes));
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.cyan} {msg} {wide_bar:.cyan/blue} {bytes}/{total_bytes}",
-            )
-            .expect("static template"),
-        );
-        pb.set_message("claude: parsing transcripts");
-        pb
-    });
-    let results: Vec<(PathBuf, Option<Outcome>)> = planned
-        .into_par_iter()
-        .map(|(path, len, plan)| {
-            let (oc, done) = match plan {
-                Plan::Reuse => (Some(Outcome::Reuse), 0),
-                Plan::Resume(offset, ()) => {
-                    // seed from the cached dict so tail entries reuse
-                    // existing string indices
-                    let dict = cache.get(&path).map(|e| e.dict.clone()).unwrap_or_default();
-                    (
-                        parse_file(&path, offset, dict)
-                            .ok()
-                            .map(|(c, d, e)| Outcome::Resumed(c, d, e)),
-                        len - offset,
-                    )
-                }
-                Plan::Full => (
-                    parse_file(&path, 0, Vec::new())
-                        .ok()
-                        .map(|(c, d, e)| Outcome::Full(c, d, e)),
-                    len,
-                ),
-            };
-            if let Some(pb) = &pb {
-                pb.inc(done);
-            }
-            (path, oc)
-        })
-        .collect();
-    if let Some(pb) = pb {
-        pb.finish_and_clear();
-    }
-
-    let mut new_cache: HashMap<PathBuf, Entry<()>> = HashMap::with_capacity(results.len());
-    let mut parsed_new = 0usize;
-    for (path, oc) in results {
-        let Some(oc) = oc else { continue }; // unreadable file: dropped
-        let (offset, dict, mut tail, keep_old) = match oc {
-            Outcome::Reuse => {
-                if let Some(e) = cache.remove(&path) {
-                    new_cache.insert(path, e);
-                }
-                continue;
-            }
-            Outcome::Resumed(o, d, t) => (o, d, t, true),
-            Outcome::Full(o, d, t) => (o, d, t, false),
-        };
-        // a resumed parse starts from the file's cached dict so existing
-        // indices stay valid; a full parse rebuilds it
-        let mut entries = if keep_old {
-            cache.remove(&path).map(|e| e.entries).unwrap_or_default()
-        } else {
-            cache.remove(&path);
-            Vec::new()
-        };
-        entries.append(&mut tail);
-        new_cache.insert(
-            path.clone(),
-            Entry {
-                offset,
-                mtime: filecache::mtime(&path),
-                boundary: filecache::boundary(&path, offset),
-                state: (),
-                dict,
-                entries,
-            },
-        );
-        parsed_new += 1;
-    }
-    // rewrite the cache only when something changed — leftovers in `cache`
-    // are files deleted since the last run
-    if parsed_new > 0 || !cache.is_empty() {
-        filecache::save("claude-files", &scope, &new_cache);
-    }
-
-    tracing::debug!(parsed_new, todo_bytes, elapsed = ?t0.elapsed(), "claude walk+parse done");
-
-    // iterate in walk order — deterministic across runs
-    let t1 = std::time::Instant::now();
-    let mut seen = HashSet::new();
-    let mut calls = Vec::new();
-    let mut skipped_dupes = 0usize;
-    let mut total_entries = 0usize;
-    for (path, _) in &files {
-        let Some(e) = new_cache.get(path) else {
-            continue;
-        };
-        let dict: Vec<Arc<str>> = e.dict.iter().map(|s| s.as_str().into()).collect();
-        for c in &e.entries {
-            total_entries += 1;
-            if seen.insert(c.key) {
-                calls.push(c.to_call("claude", &dict));
-            } else {
-                skipped_dupes += 1;
-            }
-        }
-    }
+pub fn load(dir: &Path, mp: &MultiProgress) -> Result<SourceOut> {
+    let t0 = std::time::Instant::now();
+    let mut sc = Scanner::open(vec![dir.to_path_buf()]);
+    let found = walk(dir);
+    let t = sc.tick(&found, mp);
+    sc.save();
     tracing::debug!(
-        files = files.len(),
-        parsed_new,
-        total_entries,
-        calls = calls.len(),
-        merge = ?t1.elapsed(),
+        files = t.files,
+        parsed = t.parsed,
+        bytes = t.bytes,
+        calls = t.calls.len(),
+        dupes = t.dupes,
         elapsed = ?t0.elapsed(),
         "claude source"
     );
-
     let mut note = format!(
-        "claude: {} transcript files · {parsed_new} reparsed",
-        files.len()
+        "claude: {} transcript files · {} reparsed",
+        t.files, t.parsed
     );
-    if skipped_dupes > 0 {
-        note.push_str(&format!(" · {skipped_dupes} dupes skipped"));
+    if t.dupes > 0 {
+        note.push_str(&format!(" · {} dupes skipped", t.dupes));
     }
-    Ok(SourceOut { calls, note })
+    Ok(SourceOut {
+        calls: t.calls,
+        note,
+    })
 }
