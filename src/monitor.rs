@@ -395,16 +395,20 @@ fn sorted_views(st: &State, sort: (Col, Dir), now: i64) -> Vec<View> {
     views
 }
 
-/// Hit-test a body row's SESSION cell; returns the row's `(source,
-/// session)` key so a click can toggle name↔id on that row only.
-fn body_hit(
-    frame: Rect,
-    x: u16,
-    y: u16,
-    st: &State,
-    sort: (Col, Dir),
-    now: i64,
-) -> Option<(&'static str, Arc<str>)> {
+/// A clickable target under the cursor — drives both clicks and hover.
+#[derive(PartialEq)]
+enum Hit {
+    /// A sortable column header.
+    Header(Col),
+    /// A body row's SESSION cell: (source, canonical session id).
+    Session(&'static str, Arc<str>),
+}
+
+/// What is under `(x, y)` right now — shared by click and hover handling.
+fn hit_test(frame: Rect, x: u16, y: u16, st: &State, sort: (Col, Dir), now: i64) -> Option<Hit> {
+    if let Some(c) = header_hit(frame, x, y) {
+        return Some(Hit::Header(c));
+    }
     let (_, t, _) = areas(frame);
     // top border + header occupy the first two lines
     let i = y.checked_sub(t.y + 2)? as usize;
@@ -419,7 +423,7 @@ fn body_hit(
         return None;
     }
     let v = sorted_views(st, sort, now).into_iter().nth(i)?;
-    Some((v.source, v.session))
+    Some(Hit::Session(v.source, v.session))
 }
 
 /// `LAST` column: "MM-DD HH:MM" in local time.
@@ -436,6 +440,7 @@ fn draw(
     interval: Duration,
     sort: (Col, Dir),
     toggled: &std::collections::HashSet<(&'static str, Arc<str>)>,
+    hover: Option<&Hit>,
 ) {
     let now = Utc::now().timestamp();
     let (chart_a, table_a, foot_a) = areas(f.area());
@@ -524,12 +529,24 @@ fn draw(
         } else {
             v.name.as_deref().unwrap_or(&v.session)
         };
+        let hovered =
+            matches!(hover, Some(Hit::Session(s, id)) if *s == v.source && id == &v.session);
+        let session_cell = if hovered {
+            Cell::from(Span::styled(
+                shown.to_string(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::UNDERLINED),
+            ))
+        } else {
+            Cell::from(shown.to_string())
+        };
         TRow::new(vec![
             Cell::from(Span::styled(
                 v.source.to_string(),
                 Style::default().fg(color_of(v.source)),
             )),
-            Cell::from(shown.to_string()),
+            session_cell,
             Cell::from(Span::styled(
                 v.model.to_string(),
                 Style::default().fg(Color::DarkGray),
@@ -547,6 +564,9 @@ fn draw(
         if *c == col {
             s.push(if dir == Dir::Desc { '▼' } else { '▲' });
             style = style.fg(Color::Cyan);
+        }
+        if matches!(hover, Some(Hit::Header(h)) if h == c) {
+            style = style.add_modifier(Modifier::UNDERLINED);
         }
         Cell::from(Span::styled(s, style))
     }));
@@ -637,8 +657,10 @@ pub fn run(
     let mut sort = (Col::Rate, Dir::Desc);
     // Rows whose SESSION cell shows the canonical id instead of the name.
     let mut toggled = std::collections::HashSet::new();
+    // Clickable element under the cursor — underline affordance.
+    let mut hover: Option<Hit> = None;
     'outer: loop {
-        term.draw(|f| draw(f, &st, interval, sort, &toggled))?;
+        term.draw(|f| draw(f, &st, interval, sort, &toggled, hover.as_ref()))?;
         let deadline = Instant::now() + interval;
         while event::poll(deadline.saturating_duration_since(Instant::now()))? {
             match event::read()? {
@@ -651,22 +673,35 @@ pub fn run(
                     break 'outer;
                 }
                 Event::Resize(_, _) => continue 'outer,
+                Event::Mouse(m) if m.kind == MouseEventKind::Moved => {
+                    let size = term.size()?;
+                    let frame = Rect::new(0, 0, size.width, size.height);
+                    let hit = hit_test(frame, m.column, m.row, &st, sort, Utc::now().timestamp());
+                    if hit != hover {
+                        hover = hit;
+                        continue 'outer;
+                    }
+                }
                 Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
                     let size = term.size()?;
                     let frame = Rect::new(0, 0, size.width, size.height);
-                    if let Some(c) = header_hit(frame, m.column, m.row) {
-                        sort = if sort.0 == c {
-                            (c, sort.1.flip())
-                        } else {
-                            (c, default_dir(c))
-                        };
-                        continue 'outer;
-                    }
-                    if let Some(key) =
-                        body_hit(frame, m.column, m.row, &st, sort, Utc::now().timestamp())
-                        && !toggled.remove(&key)
-                    {
-                        toggled.insert(key);
+                    match hit_test(frame, m.column, m.row, &st, sort, Utc::now().timestamp()) {
+                        Some(Hit::Header(c)) => {
+                            sort = if sort.0 == c {
+                                (c, sort.1.flip())
+                            } else {
+                                (c, default_dir(c))
+                            };
+                            continue 'outer;
+                        }
+                        Some(Hit::Session(s, id)) => {
+                            let key = (s, id);
+                            if !toggled.remove(&key) {
+                                toggled.insert(key);
+                            }
+                            continue 'outer;
+                        }
+                        None => {}
                     }
                 }
                 _ => {}

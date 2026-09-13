@@ -25,7 +25,8 @@ llmstat monitor         # real-time monitor: rolling tok/s chart + per-session t
 and shows tokens/s per source over the last 10 minutes plus a per-session
 table. Sessions show their human-readable name (task title, slug, or first
 prompt) — click the SESSION cell to toggle a row to its canonical id. Click a
-column header to sort (rate desc, then last activity, by default). Tokens
+column header to sort (rate desc, then last activity, by default); clickable
+elements underline on hover. Tokens
 appear when each API call completes — that is when the CLIs write usage to
 disk. Quit with `q`, `Esc`, or `Ctrl-C`.
 
