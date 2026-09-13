@@ -531,16 +531,11 @@ fn draw(
         };
         let hovered =
             matches!(hover, Some(Hit::Session(s, id)) if *s == v.source && id == &v.session);
-        let session_cell = if hovered {
-            Cell::from(Span::styled(
-                shown.to_string(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::UNDERLINED),
-            ))
-        } else {
-            Cell::from(shown.to_string())
-        };
+        // hover = full opacity, rest dimmed one step
+        let session_cell = Cell::from(Span::styled(
+            shown.to_string(),
+            Style::default().fg(if hovered { Color::White } else { Color::Gray }),
+        ));
         TRow::new(vec![
             Cell::from(Span::styled(
                 v.source.to_string(),
@@ -560,13 +555,15 @@ fn draw(
     });
     let header = TRow::new(COLS.iter().map(|(c, name, _)| {
         let mut s = (*name).to_string();
-        let mut style = Style::default().add_modifier(Modifier::BOLD);
+        let mut style = Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD);
         if *c == col {
             s.push(if dir == Dir::Desc { '▼' } else { '▲' });
             style = style.fg(Color::Cyan);
         }
         if matches!(hover, Some(Hit::Header(h)) if h == c) {
-            style = style.add_modifier(Modifier::UNDERLINED);
+            style = style.fg(Color::White);
         }
         Cell::from(Span::styled(s, style))
     }));

@@ -1,6 +1,6 @@
 [package]
 name = "llmstat"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Token usage distribution and cost across local LLM CLIs"
 license = "MIT"
@@ -32,3 +32,8 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

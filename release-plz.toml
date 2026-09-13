@@ -1,0 +1,12 @@
+[workspace]
+# crates.io publish happens in release.yml (tag-triggered, OIDC trusted
+# publishing is bound to that workflow file). release-plz only computes
+# versions, updates the changelog, and pushes the git tag.
+publish = false
+# git tag v{version} — the tag push triggers the cargo-dist release.yml,
+# which publishes to crates.io and builds the binaries in one run.
+git_tag_enable = true
+# The GitHub Release itself is created by cargo-dist so it can attach
+# binaries and install instructions.
+git_release_enable = false
+changelog_update = true
