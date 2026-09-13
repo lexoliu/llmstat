@@ -7,14 +7,17 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
@@ -28,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::fmt;
-use crate::pricing::{Price, PriceBook, Pricing, Resolved};
+use crate::pricing::{PriceBook, Pricing, Resolved};
 use crate::report::{Call, Usage};
 use crate::sources::AnyScanner;
 
@@ -99,23 +102,29 @@ impl Ring {
     }
 }
 
-/// One per-(source, model-label) table row.
+/// One per-(source, session) table row. Cost accumulates per call so a
+/// session that mixed models still bills correctly; `list` is the
+/// equivalent list price, `actual` what the CLI charges (free → 0).
 struct Row {
-    pricing: Pricing,
-    price: Option<Price>,
     usage: Usage,
     calls: u64,
     ring: Ring,
+    /// model -> tokens, to show the session's dominant model.
+    models: HashMap<Arc<str>, u64>,
+    list: f64,
+    actual: f64,
+    unpriced: bool,
 }
 
 /// Everything the dashboard shows; `apply` folds each tick's new calls in.
 pub struct State {
+    /// Keyed by (source, session id/name).
     rows: HashMap<(&'static str, Arc<str>), Row>,
     /// Per-source tok/s history for the chart.
     series: HashMap<&'static str, Ring>,
     /// raw model -> resolved pricing (memoized like report::build).
     resolved: HashMap<Arc<str>, usize>,
-    resolved_list: Vec<(Arc<str>, Resolved)>,
+    resolved_list: Vec<Resolved>,
     /// All-time totals across every call seen.
     total: Usage,
     calls: u64,
@@ -157,27 +166,30 @@ impl State {
         let now = Utc::now().timestamp();
         for c in calls {
             let ridx = *self.resolved.entry(c.model.clone()).or_insert_with(|| {
-                let r = book.resolve(&c.model);
-                self.resolved_list.push((r.label.as_str().into(), r));
+                self.resolved_list.push(book.resolve(&c.model));
                 self.resolved_list.len() - 1
             });
-            let (label, pricing, price) = {
-                let (l, r) = &self.resolved_list[ridx];
-                (l.clone(), r.pricing.clone(), r.price)
-            };
+            let r = &self.resolved_list[ridx];
+            let (pricing, price) = (r.pricing.clone(), r.price);
             let sec = c.ts.map(|t| t.timestamp()).unwrap_or(now).min(now);
             let tot = c.usage.total();
 
-            let row = self.rows.entry((c.source, label)).or_insert_with(|| Row {
-                pricing: pricing.clone(),
-                price,
-                usage: Usage::default(),
-                calls: 0,
-                ring: Ring::new(),
-            });
+            let row = self
+                .rows
+                .entry((c.source, c.session.clone()))
+                .or_insert_with(|| Row {
+                    usage: Usage::default(),
+                    calls: 0,
+                    ring: Ring::new(),
+                    models: HashMap::new(),
+                    list: 0.0,
+                    actual: 0.0,
+                    unpriced: false,
+                });
             row.usage.add(&c.usage);
             row.calls += 1;
             row.ring.add(sec, tot);
+            *row.models.entry(c.model.clone()).or_default() += tot;
             self.series
                 .entry(c.source)
                 .or_insert_with(Ring::new)
@@ -190,13 +202,18 @@ impl State {
             match price {
                 Some(p) => {
                     let cost = c.usage.cost(&p);
+                    row.list += cost;
                     self.list_cost += cost;
                     if matches!(pricing, Pricing::Paid) {
+                        row.actual += cost;
                         self.actual_cost += cost;
                         self.session_cost += cost;
                     }
                 }
-                None => self.unpriced = true,
+                None => {
+                    row.unpriced = true;
+                    self.unpriced = true;
+                }
             }
         }
     }
@@ -220,14 +237,97 @@ fn color_of(source: &str) -> Color {
     }
 }
 
-fn draw(f: &mut Frame, st: &State, interval: Duration) {
-    let now = Utc::now().timestamp();
-    let [chart_a, table_a, foot_a] = Layout::vertical([
+/// Sortable table columns, in display order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Col {
+    Src,
+    Session,
+    Model,
+    Tokens,
+    Calls,
+    Rate,
+    Cost,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Dir {
+    Asc,
+    Desc,
+}
+
+impl Dir {
+    fn flip(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+}
+
+const COLS: [(Col, &str, Constraint); 7] = [
+    (Col::Src, "SRC", Constraint::Length(7)),
+    (Col::Session, "SESSION", Constraint::Min(20)),
+    (Col::Model, "MODEL", Constraint::Length(18)),
+    (Col::Tokens, "TOKENS", Constraint::Length(10)),
+    (Col::Calls, "CALLS", Constraint::Length(9)),
+    (Col::Rate, "RATE", Constraint::Length(10)),
+    (Col::Cost, "COST", Constraint::Length(20)),
+];
+
+/// First click on a column picks this direction (metrics descend, names
+/// ascend — the usual expectation).
+fn default_dir(c: Col) -> Dir {
+    match c {
+        Col::Src | Col::Session | Col::Model => Dir::Asc,
+        _ => Dir::Desc,
+    }
+}
+
+/// The three vertical regions — shared by draw and mouse hit-testing.
+fn areas(frame: Rect) -> (Rect, Rect, Rect) {
+    let [chart, table, foot] = Layout::vertical([
         Constraint::Percentage(40),
         Constraint::Min(6),
         Constraint::Length(2),
     ])
-    .areas(f.area());
+    .areas(frame);
+    (chart, table, foot)
+}
+
+/// Column hit-test on the table header row (the line under the top border).
+fn header_hit(frame: Rect, x: u16, y: u16) -> Option<Col> {
+    let (_, t, _) = areas(frame);
+    if y != t.y + 1 {
+        return None;
+    }
+    let header = Rect::new(t.x, t.y + 1, t.width, 1);
+    let widths = COLS.map(|(_, _, w)| w);
+    let cells = Layout::horizontal(widths).spacing(1).split(header);
+    for (i, r) in cells.iter().enumerate() {
+        if x >= r.x && x < r.x + r.width {
+            return Some(COLS[i].0);
+        }
+    }
+    None
+}
+
+/// A row flattened for sorting/rendering.
+struct View {
+    source: &'static str,
+    session: Arc<str>,
+    /// Dominant model by tokens.
+    model: Arc<str>,
+    usage: Usage,
+    calls: u64,
+    rate: f64,
+    list: f64,
+    actual: f64,
+    unpriced: bool,
+}
+
+fn draw(f: &mut Frame, st: &State, interval: Duration, sort: (Col, Dir)) {
+    let now = Utc::now().timestamp();
+    let (chart_a, table_a, foot_a) = areas(f.area());
 
     // ── rolling rate chart ────────────────────────────────────────────
     let mut data = Vec::new();
@@ -282,62 +382,96 @@ fn draw(f: &mut Frame, st: &State, interval: Duration) {
         );
     f.render_widget(chart, chart_a);
 
-    // ── per-model table ───────────────────────────────────────────────
-    let mut rows: Vec<(&(&'static str, Arc<str>), &Row)> = st.rows.iter().collect();
-    rows.sort_by_key(|(_, r)| std::cmp::Reverse(r.usage.total()));
-    let body = rows.iter().map(|((source, label), r)| {
-        let rate = r.ring.sum_since(now - RATE_WIN) as f64 / RATE_WIN as f64;
-        let num = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
-        let cost = match r.price {
-            Some(p) => {
-                let list = fmt::money(r.usage.cost(&p));
-                match r.pricing {
-                    Pricing::Free => Cell::from(
-                        Line::from(vec![
-                            Span::styled(
-                                list,
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::CROSSED_OUT),
-                            ),
-                            Span::raw(" "),
-                            Span::styled("$0.00", Style::default().fg(Color::Green)),
-                        ])
-                        .alignment(Alignment::Right),
-                    ),
-                    _ => num(list),
-                }
-            }
-            None => num("?".into()),
+    // ── per-session table ─────────────────────────────────────────────
+    let mut views: Vec<View> = st
+        .rows
+        .iter()
+        .map(|((source, session), r)| View {
+            source,
+            session: session.clone(),
+            model: r
+                .models
+                .iter()
+                .max_by_key(|(_, t)| **t)
+                .map(|(m, _)| m.clone())
+                .unwrap_or_default(),
+            usage: r.usage,
+            calls: r.calls,
+            rate: r.ring.sum_since(now - RATE_WIN) as f64 / RATE_WIN as f64,
+            list: r.list,
+            actual: r.actual,
+            unpriced: r.unpriced,
+        })
+        .collect();
+    let (col, dir) = sort;
+    views.sort_by(|a, b| {
+        let ord = match col {
+            Col::Src => a.source.cmp(b.source),
+            Col::Session => a.session.cmp(&b.session),
+            Col::Model => a.model.cmp(&b.model),
+            Col::Tokens => a.usage.total().cmp(&b.usage.total()),
+            Col::Calls => a.calls.cmp(&b.calls),
+            Col::Rate => a.rate.total_cmp(&b.rate),
+            Col::Cost => a.actual.total_cmp(&b.actual),
         };
+        match dir {
+            Dir::Asc => ord,
+            Dir::Desc => ord.reverse(),
+        }
+        // stable secondary: heavier sessions first
+        .then_with(|| b.usage.total().cmp(&a.usage.total()))
+    });
+    let num = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
+    let body = views.iter().map(|v| {
+        let mut spans = Vec::new();
+        if v.list > v.actual + f64::EPSILON {
+            spans.push(Span::styled(
+                fmt::money(v.list),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            ));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                fmt::money(v.actual),
+                Style::default().fg(Color::Green),
+            ));
+        } else if v.unpriced && v.list == 0.0 {
+            spans.push(Span::raw("?"));
+        } else {
+            spans.push(Span::raw(fmt::money(v.actual)));
+        }
+        if v.unpriced && v.list > 0.0 {
+            spans.push(Span::styled(" ?", Style::default().fg(Color::DarkGray)));
+        }
         TRow::new(vec![
             Cell::from(Span::styled(
-                source.to_string(),
-                Style::default().fg(color_of(source)),
+                v.source.to_string(),
+                Style::default().fg(color_of(v.source)),
             )),
-            Cell::from(label.to_string()),
-            num(fmt::tokens(r.usage.total())),
-            num(fmt::int(r.calls as usize)),
-            num(format!("{}/s", fmt::tokens(rate as u64))),
-            cost,
+            Cell::from(v.session.to_string()),
+            Cell::from(Span::styled(
+                v.model.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )),
+            num(fmt::tokens(v.usage.total())),
+            num(fmt::int(v.calls as usize)),
+            num(format!("{}/s", fmt::tokens(v.rate as u64))),
+            Cell::from(Line::from(spans).alignment(Alignment::Right)),
         ])
     });
-    let table = Table::new(
-        body,
-        [
-            Constraint::Length(7),
-            Constraint::Min(16),
-            Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Length(18),
-        ],
-    )
-    .header(
-        TRow::new(vec!["SRC", "MODEL", "TOKENS", "CALLS", "RATE", "COST"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(Block::default().borders(Borders::TOP));
+    let header = TRow::new(COLS.iter().map(|(c, name, _)| {
+        let mut s = (*name).to_string();
+        let mut style = Style::default().add_modifier(Modifier::BOLD);
+        if *c == col {
+            s.push(if dir == Dir::Desc { '▼' } else { '▲' });
+            style = style.fg(Color::Cyan);
+        }
+        Cell::from(Span::styled(s, style))
+    }));
+    let table = Table::new(body, COLS.map(|(_, _, w)| w))
+        .header(header)
+        .block(Block::default().borders(Borders::TOP));
     f.render_widget(table, table_a);
 
     // ── footer: session delta · all-time totals · status ──────────────
@@ -366,7 +500,10 @@ fn draw(f: &mut Frame, st: &State, interval: Duration) {
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(
-            format!("  │  {}ms tick · q quit", interval.as_millis()),
+            format!(
+                "  │  {}ms tick · click header to sort · q quit",
+                interval.as_millis()
+            ),
             Style::default().fg(Color::DarkGray),
         ),
     ];
@@ -392,7 +529,7 @@ struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -409,15 +546,16 @@ pub fn run(
     }
     enable_raw_mode()?;
     let mut stdout: Stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let _guard = Guard;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
     // Scanner progress must not draw over the TUI.
     let hidden = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
     let mut save_at = Instant::now() + SAVE_EVERY;
+    let mut sort = (Col::Rate, Dir::Desc);
     'outer: loop {
-        term.draw(|f| draw(f, &st, interval))?;
+        term.draw(|f| draw(f, &st, interval, sort))?;
         let deadline = Instant::now() + interval;
         while event::poll(deadline.saturating_duration_since(Instant::now()))? {
             match event::read()? {
@@ -430,6 +568,18 @@ pub fn run(
                     break 'outer;
                 }
                 Event::Resize(_, _) => continue 'outer,
+                Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    let size = term.size()?;
+                    let frame = Rect::new(0, 0, size.width, size.height);
+                    if let Some(c) = header_hit(frame, m.column, m.row) {
+                        sort = if sort.0 == c {
+                            (c, sort.1.flip())
+                        } else {
+                            (c, default_dir(c))
+                        };
+                        continue 'outer;
+                    }
+                }
                 _ => {}
             }
         }
