@@ -42,6 +42,9 @@ pub struct Call {
     pub source: &'static str,
     /// Session identifier within that source.
     pub session: Arc<str>,
+    /// Human-readable session name when the source tracks one (claude slug,
+    /// codex first prompt, devin title) — `session` stays the canonical id.
+    pub session_name: Option<Arc<str>>,
     /// Raw model name as recorded by the CLI.
     pub model: Arc<str>,
     pub ts: Option<DateTime<Utc>>,

@@ -1,5 +1,5 @@
 mod fmt;
-mod live;
+mod monitor;
 mod pricing;
 mod render;
 mod report;
@@ -79,8 +79,8 @@ enum Cmd {
     Month,
     /// All recorded history (default).
     All,
-    /// Real-time monitor: rolling tok/s chart + per-model table (TUI).
-    Live {
+    /// Real-time monitor: rolling tok/s chart + per-session table (TUI).
+    Monitor {
         /// Refresh interval in milliseconds.
         #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
@@ -180,9 +180,9 @@ fn spawn_overall_spinner<'scope, 'env>(
     });
 }
 
-/// `llmstat live`: build resident scanners, take one full tick with the
+/// `llmstat monitor`: build resident scanners, take one full tick with the
 /// usual progress UX, then hand off to the TUI loop.
-fn run_live(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
+fn run_monitor(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
     let src = resolve_sources(args)?;
     let mut rules = pricing::load_default_rules();
     if let Some(p) = &args.pricing {
@@ -208,7 +208,7 @@ fn run_live(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
 
     let mp = MultiProgress::new();
     let done = Arc::new(AtomicBool::new(false));
-    let mut state = live::State::new();
+    let mut state = monitor::State::new();
     let book = std::thread::scope(|s| {
         spawn_overall_spinner(s, done.clone(), &mp);
         let litellm_h = s.spawn(|| pricing::litellm::LiteBook::load(args.refresh_prices));
@@ -236,7 +236,7 @@ fn run_live(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
         done.store(true, Ordering::Relaxed);
         book
     });
-    live::run(&mut scanners, state, &book, interval)
+    monitor::run(&mut scanners, state, &book, interval)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -251,8 +251,8 @@ fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
     let now = Utc::now();
     let (desc, since, bucket) = match args.cmd.take().unwrap_or(Cmd::All) {
-        Cmd::Live { interval_ms } => {
-            return run_live(
+        Cmd::Monitor { interval_ms } => {
+            return run_monitor(
                 &args,
                 std::time::Duration::from_millis(interval_ms.max(200)),
             );

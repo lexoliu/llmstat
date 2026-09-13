@@ -119,7 +119,7 @@ fn workers() -> usize {
 }
 
 /// Stateful scanner holding the db connection open: `tick` probes
-/// `max(row_id)` and range-scans only the unseen tail, so a `live` poll is
+/// `max(row_id)` and range-scans only the unseen tail, so a `monitor` poll is
 /// a sub-millisecond B-tree descent when idle. The first tick is the full
 /// incremental scan (disk cache + parallel ranges), same as a one-shot run.
 pub struct Scanner {
@@ -133,17 +133,23 @@ pub struct Scanner {
     best: HashMap<(String, String), (u64, i64)>,
     /// (session, mid) pairs already emitted as calls.
     emitted: HashSet<(String, String)>,
-    /// session id -> model recorded on the session row (may be empty).
-    pub session_models: HashMap<String, String>,
+    /// session id -> (model on the session row, task title).
+    pub session_meta: HashMap<String, (String, Option<String>)>,
 }
 
-fn session_models(conn: &Connection) -> Result<HashMap<String, String>> {
+fn session_meta(conn: &Connection) -> Result<HashMap<String, (String, Option<String>)>> {
     let mut out = HashMap::new();
-    let mut st = conn.prepare("SELECT id, COALESCE(model,'') FROM sessions")?;
-    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut st = conn.prepare("SELECT id, COALESCE(model,''), title FROM sessions")?;
+    let rows = st.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
     for r in rows {
-        let (id, m) = r?;
-        out.insert(id, m);
+        let (id, m, t) = r?;
+        out.insert(id, (m, t));
     }
     Ok(out)
 }
@@ -161,7 +167,7 @@ impl Scanner {
     /// first `tick` scans whatever tail the cache doesn't cover.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = open(path)?;
-        let models = session_models(&conn)?;
+        let models = session_meta(&conn)?;
         let cur_max = max_rowid(&conn)?;
         let (rows, next_rowid) = match cache::load(path, cur_max) {
             Some((max_rowid, cached)) => (cached, max_rowid + 1),
@@ -182,7 +188,7 @@ impl Scanner {
             rows,
             best,
             emitted: HashSet::new(),
-            session_models: models,
+            session_meta: models,
         })
     }
 
@@ -269,7 +275,7 @@ impl Scanner {
             }
             self.rows.push(r);
         }
-        self.session_models = session_models(&self.conn)?;
+        self.session_meta = session_meta(&self.conn)?;
         cache::save(&self.path, cur_max, &self.rows);
         Ok(out)
     }

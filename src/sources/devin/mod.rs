@@ -5,7 +5,7 @@
 //! compacted or forked chains, and subagent sessions that never get a
 //! transcript at all.
 //!
-//! In `live` mode the scanner reads transcripts once (they establish the
+//! In `monitor` mode the scanner reads transcripts once (they establish the
 //! exact-token multiset and the cached/output split ratios), then tails
 //! sessions.db: new inference calls arrive as db rows and get their split
 //! projected from the ratios — same accounting as a one-shot run.
@@ -147,6 +147,12 @@ impl Scanner {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
+            let title: Option<Arc<str>> = self
+                .db
+                .as_ref()
+                .and_then(|d| d.session_meta.get(&name))
+                .and_then(|(_, t)| t.as_deref())
+                .map(Arc::from);
 
             for step in &t.steps {
                 let (Some(m), Some(raw_model)) = (&step.metrics, &step.model_name) else {
@@ -181,6 +187,7 @@ impl Scanner {
                 calls.push(Call {
                     source: "devin",
                     session: name.as_str().into(),
+                    session_name: title.clone(),
                     model: raw_model.as_str().into(),
                     ts,
                     usage: Usage {
@@ -223,19 +230,23 @@ impl Scanner {
         };
         let cached = ((call.prompt as f64 * cr).round() as u64).min(call.prompt);
         let output = (call.prompt as f64 * or_).round() as u64;
-        let model = self
+        let meta = self
             .db
             .as_ref()
-            .and_then(|d| d.session_models.get(&call.session))
+            .and_then(|d| d.session_meta.get(&call.session));
+        let model = meta
+            .map(|(m, _)| m)
             .filter(|s| !s.is_empty())
             .cloned()
             .or_else(|| self.top_model.get(&call.session).map(|(m, _)| m.clone()))
             .unwrap_or_else(|| "unknown".to_string());
+        let title = meta.and_then(|(_, t)| t.as_deref()).map(Arc::from);
         self.recovered_calls += 1;
         self.recovered_tokens += call.prompt;
         Some(Call {
             source: "devin",
             session: Arc::from(call.session.as_str()),
+            session_name: title,
             model: model.into(),
             ts: DateTime::from_timestamp(call.ts, 0),
             usage: Usage {

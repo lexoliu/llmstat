@@ -17,7 +17,7 @@ pub struct SourceOut {
     pub note: String,
 }
 
-/// The closed set of source scanners for `live` mode — one variant per
+/// The closed set of source scanners for `monitor` mode — one variant per
 /// CLI, each holding whatever state its incremental format needs.
 pub enum AnyScanner {
     Devin(Box<devin::Scanner>),

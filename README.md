@@ -18,13 +18,16 @@ llmstat                 # all recorded history (default: `all`)
 llmstat day             # last 24 hours, hourly timeline  (alias: 24h)
 llmstat week            # last 7 days, daily timeline
 llmstat month           # last 30 days, daily timeline
-llmstat live            # real-time monitor: rolling tok/s chart + per-model table
+llmstat monitor         # real-time monitor: rolling tok/s chart + per-session table
 ```
 
-`live` polls the append-only logs (default 1s, `--interval-ms` floor 200ms) and
-shows tokens/s per source over the last 10 minutes plus cumulative usage and
-cost. Tokens appear when each API call completes — that is when the CLIs write
-usage to disk. Quit with `q`, `Esc`, or `Ctrl-C`.
+`monitor` polls the append-only logs (default 1s, `--interval-ms` floor 200ms)
+and shows tokens/s per source over the last 10 minutes plus a per-session
+table. Sessions show their human-readable name (task title, slug, or first
+prompt) — click the SESSION cell to toggle a row to its canonical id. Click a
+column header to sort (rate desc, then last activity, by default). Tokens
+appear when each API call completes — that is when the CLIs write usage to
+disk. Quit with `q`, `Esc`, or `Ctrl-C`.
 
 ```
 llmstat --sources devin,claude      # read only these sources

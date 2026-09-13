@@ -1,12 +1,12 @@
-//! `llmstat live` — a real-time token monitor.
+//! `llmstat monitor` — a real-time token monitor.
 //!
 //! Scanners tick on an interval and emit only newly-observed calls; the
 //! state below accumulates them into a rolling per-source rate chart plus
-//! a per-model table. Usage lands when each API call completes, so the
+//! a per-session table. Usage lands when each API call completes, so the
 //! granularity is per-call at second resolution.
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEventKind,
@@ -111,6 +111,11 @@ struct Row {
     ring: Ring,
     /// model -> tokens, to show the session's dominant model.
     models: HashMap<Arc<str>, u64>,
+    /// Human-readable session name (title/slug/prompt); ids stay hidden
+    /// until the cell is clicked.
+    name: Option<Arc<str>>,
+    /// Latest observed call timestamp (unix seconds).
+    last_ts: i64,
     list: f64,
     actual: f64,
     unpriced: bool,
@@ -182,6 +187,8 @@ impl State {
                     calls: 0,
                     ring: Ring::new(),
                     models: HashMap::new(),
+                    name: None,
+                    last_ts: 0,
                     list: 0.0,
                     actual: 0.0,
                     unpriced: false,
@@ -189,6 +196,10 @@ impl State {
             row.usage.add(&c.usage);
             row.calls += 1;
             row.ring.add(sec, tot);
+            row.last_ts = row.last_ts.max(sec);
+            if row.name.is_none() {
+                row.name = c.session_name.clone();
+            }
             *row.models.entry(c.model.clone()).or_default() += tot;
             self.series
                 .entry(c.source)
@@ -246,6 +257,7 @@ enum Col {
     Tokens,
     Calls,
     Rate,
+    Last,
     Cost,
 }
 
@@ -264,13 +276,14 @@ impl Dir {
     }
 }
 
-const COLS: [(Col, &str, Constraint); 7] = [
+const COLS: [(Col, &str, Constraint); 8] = [
     (Col::Src, "SRC", Constraint::Length(7)),
     (Col::Session, "SESSION", Constraint::Min(20)),
     (Col::Model, "MODEL", Constraint::Length(18)),
     (Col::Tokens, "TOKENS", Constraint::Length(10)),
     (Col::Calls, "CALLS", Constraint::Length(9)),
     (Col::Rate, "RATE", Constraint::Length(10)),
+    (Col::Last, "LAST", Constraint::Length(12)),
     (Col::Cost, "COST", Constraint::Length(20)),
 ];
 
@@ -314,18 +327,116 @@ fn header_hit(frame: Rect, x: u16, y: u16) -> Option<Col> {
 /// A row flattened for sorting/rendering.
 struct View {
     source: &'static str,
+    /// Canonical session id — shown when the row is toggled.
     session: Arc<str>,
+    /// Human-readable name; falls back to the id when absent.
+    name: Option<Arc<str>>,
     /// Dominant model by tokens.
     model: Arc<str>,
     usage: Usage,
     calls: u64,
     rate: f64,
+    last_ts: i64,
     list: f64,
     actual: f64,
     unpriced: bool,
 }
 
-fn draw(f: &mut Frame, st: &State, interval: Duration, sort: (Col, Dir)) {
+/// Rows sorted per `sort` — shared by draw and mouse hit-testing so a
+/// click lands on the same row the user sees.
+fn sorted_views(st: &State, sort: (Col, Dir), now: i64) -> Vec<View> {
+    let mut views: Vec<View> = st
+        .rows
+        .iter()
+        .map(|((source, session), r)| View {
+            source,
+            session: session.clone(),
+            name: r.name.clone(),
+            model: r
+                .models
+                .iter()
+                .max_by_key(|(_, t)| **t)
+                .map(|(m, _)| m.clone())
+                .unwrap_or_default(),
+            usage: r.usage,
+            calls: r.calls,
+            rate: r.ring.sum_since(now - RATE_WIN) as f64 / RATE_WIN as f64,
+            last_ts: r.last_ts,
+            list: r.list,
+            actual: r.actual,
+            unpriced: r.unpriced,
+        })
+        .collect();
+    let (col, dir) = sort;
+    views.sort_by(|a, b| {
+        let ord = match col {
+            Col::Src => a.source.cmp(b.source),
+            Col::Session => a
+                .name
+                .as_deref()
+                .unwrap_or(&a.session)
+                .cmp(b.name.as_deref().unwrap_or(&b.session)),
+            Col::Model => a.model.cmp(&b.model),
+            Col::Tokens => a.usage.total().cmp(&b.usage.total()),
+            Col::Calls => a.calls.cmp(&b.calls),
+            Col::Rate => a.rate.total_cmp(&b.rate),
+            Col::Last => a.last_ts.cmp(&b.last_ts),
+            Col::Cost => a.actual.total_cmp(&b.actual),
+        };
+        match dir {
+            Dir::Asc => ord,
+            Dir::Desc => ord.reverse(),
+        }
+        // secondary: most recently active first (default RATE sort is
+        // therefore rate, then last-modified)
+        .then_with(|| b.last_ts.cmp(&a.last_ts))
+        .then_with(|| b.usage.total().cmp(&a.usage.total()))
+    });
+    views
+}
+
+/// Hit-test a body row's SESSION cell; returns the row's `(source,
+/// session)` key so a click can toggle name↔id on that row only.
+fn body_hit(
+    frame: Rect,
+    x: u16,
+    y: u16,
+    st: &State,
+    sort: (Col, Dir),
+    now: i64,
+) -> Option<(&'static str, Arc<str>)> {
+    let (_, t, _) = areas(frame);
+    // top border + header occupy the first two lines
+    let i = y.checked_sub(t.y + 2)? as usize;
+    if y < t.y || i >= st.rows.len().min(t.height.saturating_sub(2) as usize) {
+        return None;
+    }
+    let body = Rect::new(t.x, t.y + 1, t.width, t.height - 1);
+    let widths = COLS.map(|(_, _, w)| w);
+    let cells = Layout::horizontal(widths).spacing(1).split(body);
+    let col = cells.iter().position(|r| x >= r.x && x < r.x + r.width)?;
+    if COLS[col].0 != Col::Session {
+        return None;
+    }
+    let v = sorted_views(st, sort, now).into_iter().nth(i)?;
+    Some((v.source, v.session))
+}
+
+/// `LAST` column: "MM-DD HH:MM" in local time.
+fn last_cell(ts: i64) -> String {
+    match chrono::Local.timestamp_opt(ts, 0).single() {
+        Some(t) => t.format("%m-%d %H:%M").to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn draw(
+    f: &mut Frame,
+    st: &State,
+    interval: Duration,
+    sort: (Col, Dir),
+    toggled: &std::collections::HashSet<(&'static str, Arc<str>)>,
+) {
     let now = Utc::now().timestamp();
     let (chart_a, table_a, foot_a) = areas(f.area());
 
@@ -355,7 +466,7 @@ fn draw(f: &mut Frame, st: &State, interval: Duration, sort: (Col, Dir)) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(
-                    " llmstat live · tokens/s · last 10m · now {}/s ",
+                    " llmstat monitor · tokens/s · last 10m · now {}/s ",
                     fmt::tokens(st.rate(SMOOTH as i64) as u64)
                 ))
                 .title_alignment(Alignment::Left),
@@ -383,44 +494,8 @@ fn draw(f: &mut Frame, st: &State, interval: Duration, sort: (Col, Dir)) {
     f.render_widget(chart, chart_a);
 
     // ── per-session table ─────────────────────────────────────────────
-    let mut views: Vec<View> = st
-        .rows
-        .iter()
-        .map(|((source, session), r)| View {
-            source,
-            session: session.clone(),
-            model: r
-                .models
-                .iter()
-                .max_by_key(|(_, t)| **t)
-                .map(|(m, _)| m.clone())
-                .unwrap_or_default(),
-            usage: r.usage,
-            calls: r.calls,
-            rate: r.ring.sum_since(now - RATE_WIN) as f64 / RATE_WIN as f64,
-            list: r.list,
-            actual: r.actual,
-            unpriced: r.unpriced,
-        })
-        .collect();
+    let views = sorted_views(st, sort, now);
     let (col, dir) = sort;
-    views.sort_by(|a, b| {
-        let ord = match col {
-            Col::Src => a.source.cmp(b.source),
-            Col::Session => a.session.cmp(&b.session),
-            Col::Model => a.model.cmp(&b.model),
-            Col::Tokens => a.usage.total().cmp(&b.usage.total()),
-            Col::Calls => a.calls.cmp(&b.calls),
-            Col::Rate => a.rate.total_cmp(&b.rate),
-            Col::Cost => a.actual.total_cmp(&b.actual),
-        };
-        match dir {
-            Dir::Asc => ord,
-            Dir::Desc => ord.reverse(),
-        }
-        // stable secondary: heavier sessions first
-        .then_with(|| b.usage.total().cmp(&a.usage.total()))
-    });
     let num = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
     let body = views.iter().map(|v| {
         let mut spans = Vec::new();
@@ -444,12 +519,17 @@ fn draw(f: &mut Frame, st: &State, interval: Duration, sort: (Col, Dir)) {
         if v.unpriced && v.list > 0.0 {
             spans.push(Span::styled(" ?", Style::default().fg(Color::DarkGray)));
         }
+        let shown: &str = if toggled.contains(&(v.source, v.session.clone())) {
+            &v.session
+        } else {
+            v.name.as_deref().unwrap_or(&v.session)
+        };
         TRow::new(vec![
             Cell::from(Span::styled(
                 v.source.to_string(),
                 Style::default().fg(color_of(v.source)),
             )),
-            Cell::from(v.session.to_string()),
+            Cell::from(shown.to_string()),
             Cell::from(Span::styled(
                 v.model.to_string(),
                 Style::default().fg(Color::DarkGray),
@@ -457,6 +537,7 @@ fn draw(f: &mut Frame, st: &State, interval: Duration, sort: (Col, Dir)) {
             num(fmt::tokens(v.usage.total())),
             num(fmt::int(v.calls as usize)),
             num(format!("{}/s", fmt::tokens(v.rate as u64))),
+            num(last_cell(v.last_ts)),
             Cell::from(Line::from(spans).alignment(Alignment::Right)),
         ])
     });
@@ -501,7 +582,7 @@ fn draw(f: &mut Frame, st: &State, interval: Duration, sort: (Col, Dir)) {
         ),
         Span::styled(
             format!(
-                "  │  {}ms tick · click header to sort · q quit",
+                "  │  {}ms tick · header sorts · click a session for its id · q quit",
                 interval.as_millis()
             ),
             Style::default().fg(Color::DarkGray),
@@ -542,7 +623,7 @@ pub fn run(
     interval: Duration,
 ) -> Result<()> {
     if !std::io::stdout().is_terminal() {
-        anyhow::bail!("`live` needs a terminal");
+        anyhow::bail!("`monitor` needs a terminal");
     }
     enable_raw_mode()?;
     let mut stdout: Stdout = std::io::stdout();
@@ -554,8 +635,10 @@ pub fn run(
     let hidden = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
     let mut save_at = Instant::now() + SAVE_EVERY;
     let mut sort = (Col::Rate, Dir::Desc);
+    // Rows whose SESSION cell shows the canonical id instead of the name.
+    let mut toggled = std::collections::HashSet::new();
     'outer: loop {
-        term.draw(|f| draw(f, &st, interval, sort))?;
+        term.draw(|f| draw(f, &st, interval, sort, &toggled))?;
         let deadline = Instant::now() + interval;
         while event::poll(deadline.saturating_duration_since(Instant::now()))? {
             match event::read()? {
@@ -578,6 +661,12 @@ pub fn run(
                             (c, default_dir(c))
                         };
                         continue 'outer;
+                    }
+                    if let Some(key) =
+                        body_hit(frame, m.column, m.row, &st, sort, Utc::now().timestamp())
+                        && !toggled.remove(&key)
+                    {
+                        toggled.insert(key);
                     }
                 }
                 _ => {}

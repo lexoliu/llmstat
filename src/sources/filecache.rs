@@ -20,7 +20,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::report::{Call, Usage};
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const PROBE: usize = 64;
 
 /// 128-bit dedup key. Sources hash their identifying parts — a false
@@ -70,6 +70,16 @@ impl Dict {
     }
 }
 
+/// Find-or-push on a plain string vec — `fixup` runs after the `Dict` is
+/// consumed, so it interns by hand.
+pub fn dict_get_or_push(dict: &mut Vec<String>, s: &str) -> u32 {
+    if let Some(i) = dict.iter().position(|d| d == s) {
+        return i as u32;
+    }
+    dict.push(s.to_string());
+    (dict.len() - 1) as u32
+}
+
 /// Serializable form of `Call` (`Call.source` is `&'static str`, set by the
 /// owning source on rehydration; `session`/`model` index the entry's dict).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +88,8 @@ pub struct CachedCall {
     pub key: u128,
     /// Index into `Entry::dict`.
     pub session: u32,
+    /// Optional display name for the session, index into `Entry::dict`.
+    pub session_name: Option<u32>,
     /// Index into `Entry::dict`.
     pub model: u32,
     /// unix seconds
@@ -91,6 +103,7 @@ impl CachedCall {
         Call {
             source,
             session: dict[self.session as usize].clone(),
+            session_name: self.session_name.map(|i| dict[i as usize].clone()),
             model: dict[self.model as usize].clone(),
             ts: self.ts.and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
             usage: self.usage,
@@ -304,7 +317,7 @@ pub struct Tick {
 
 /// Stateful scanner for an append-only JSONL source. Holds the file cache
 /// and the dedup set in memory; `tick` emits only calls not emitted before,
-/// so `live` mode polls cheaply and one-shot `load` is `tick` once + save.
+/// so `monitor` mode polls cheaply and one-shot `load` is `tick` once + save.
 pub struct Scanner<J: Jsonl> {
     scope: Vec<PathBuf>,
     files: HashMap<PathBuf, Entry<J::State>>,

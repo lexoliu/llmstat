@@ -36,6 +36,10 @@ struct Payload {
     model: Option<String>,
     id: Option<String>,
     session_id: Option<String>,
+    /// `user_message` events carry the prompt text — the session's title.
+    message: Option<String>,
+    /// `session_meta`/`turn_context` carry the working directory.
+    cwd: Option<String>,
     info: Option<Info>,
 }
 
@@ -64,6 +68,10 @@ struct Tokens {
 pub struct State {
     model: String,
     sid: String,
+    /// First user prompt — the session's display name.
+    name: Option<String>,
+    /// Working directory — name fallback when no prompt was seen.
+    cwd: Option<String>,
 }
 
 /// Session dirs under a codex root (`~/.codex`).
@@ -107,6 +115,7 @@ fn parse_file(
             if !line.contains("\"model\"")
                 && !line.contains("token_count")
                 && !line.contains("session_meta")
+                && !line.contains("user_message")
             {
                 return;
             }
@@ -114,7 +123,7 @@ fn parse_file(
                 return;
             };
             // session_meta / turn_context are marked by the top-level `type`;
-            // token_count rides inside an `event_msg` payload
+            // token_count and user_message ride inside `event_msg` payloads
             let Some(p) = l.payload else { return };
             match l.kind.as_deref() {
                 Some("session_meta") | Some("turn_context") => {
@@ -123,6 +132,19 @@ fn parse_file(
                     }
                     if let Some(id) = p.session_id.as_ref().or(p.id.as_ref()) {
                         state.sid = id.clone();
+                    }
+                    if let Some(c) = &p.cwd {
+                        state.cwd.get_or_insert(c.clone());
+                    }
+                }
+                Some("event_msg") if p.kind.as_deref() == Some("user_message") => {
+                    if let Some(m) = &p.message {
+                        // first line of the first real prompt, whitespace-collapsed
+                        let title: String =
+                            m.split_whitespace().take(20).collect::<Vec<_>>().join(" ");
+                        if !title.is_empty() && !title.starts_with('<') {
+                            state.name.get_or_insert(title);
+                        }
                     }
                 }
                 Some("event_msg") if p.kind.as_deref() == Some("token_count") => {
@@ -143,6 +165,8 @@ fn parse_file(
                     entries.push(CachedCall {
                         key,
                         session: dict.intern(&state.sid),
+                        // filled by `fixup` once the first prompt is seen
+                        session_name: None,
                         model: dict.intern(&state.model),
                         ts: DateTime::parse_from_rfc3339(&ts)
                             .ok()
@@ -169,6 +193,8 @@ impl Jsonl for Codex {
         State {
             model: "unknown".into(),
             sid: session_id_of(path),
+            name: None,
+            cwd: None,
         }
     }
 
@@ -182,30 +208,36 @@ impl Jsonl for Codex {
     }
 
     /// Token events can precede the first turn_context (truncated
-    /// rollouts); attribute them to the file's final model.
+    /// rollouts); attribute them to the file's final model. Session names
+    /// come from the first user prompt, or the cwd basename.
     fn fixup(e: &mut Entry<State>) {
-        if e.state.model == "unknown" {
-            return;
-        }
-        let Some(u) = e.dict.iter().position(|s| s == "unknown") else {
-            return;
-        };
-        let m = match e.dict.iter().position(|s| s == &e.state.model) {
-            Some(i) => i as u32,
-            None => {
-                e.dict.push(e.state.model.clone());
-                (e.dict.len() - 1) as u32
+        if e.state.model != "unknown"
+            && let Some(u) = e.dict.iter().position(|s| s == "unknown")
+        {
+            let m = filecache::dict_get_or_push(&mut e.dict, &e.state.model);
+            for c in &mut e.entries {
+                if c.model == u as u32 {
+                    c.model = m;
+                }
             }
-        };
-        for c in &mut e.entries {
-            if c.model == u as u32 {
-                c.model = m;
+        }
+        let name = e.state.name.clone().or_else(|| {
+            e.state
+                .cwd
+                .as_deref()
+                .and_then(|c| c.rsplit('/').next())
+                .map(str::to_string)
+        });
+        if let Some(name) = name {
+            let i = filecache::dict_get_or_push(&mut e.dict, &name);
+            for c in &mut e.entries {
+                c.session_name = Some(i);
             }
         }
     }
 }
 
-/// Live-capable scanner: first `tick` is the full incremental scan, later
+/// Monitor-capable scanner: first `tick` is the full incremental scan, later
 /// ticks emit only newly appended calls.
 pub type Scanner = filecache::Scanner<Codex>;
 

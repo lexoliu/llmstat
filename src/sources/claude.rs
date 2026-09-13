@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::report::Usage;
 use crate::sources::SourceOut;
-use crate::sources::filecache::{self, CachedCall, Dict, Jsonl};
+use crate::sources::filecache::{self, CachedCall, Dict, Entry, Jsonl};
 
 #[derive(Deserialize)]
 struct Line {
@@ -30,6 +30,11 @@ struct Line {
     timestamp: Option<String>,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
+    /// Human-readable session slug, present on many record types.
+    slug: Option<String>,
+    /// Generated session title on `agent-name` records.
+    #[serde(rename = "agentName")]
+    agent_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -57,16 +62,27 @@ pub fn default_dir() -> PathBuf {
         .join(".claude/projects")
 }
 
-/// Claude Code's JSONL shape — no parser state to carry across resumes.
+/// Claude Code's JSONL shape.
 pub struct Claude;
 
+/// Parser state needed to resume mid-file: the session's display name is
+/// discovered on non-assistant records, possibly after calls were emitted.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct State {
+    /// `slug` — the canonical session name.
+    slug: Option<String>,
+    /// `agentName` on `agent-name` records — a generated task title.
+    title: Option<String>,
+}
+
 /// Parse `path` from `offset`, extending `dict` with new strings. Returns
-/// (consumed bytes, dict, new tail entries).
+/// (consumed bytes, final state, dict, new tail entries).
 fn parse_file(
     path: &Path,
     offset: u64,
+    mut state: State,
     dict: Vec<String>,
-) -> std::io::Result<(u64, Vec<String>, Vec<CachedCall>)> {
+) -> std::io::Result<(u64, State, Vec<String>, Vec<CachedCall>)> {
     let file_stem = path
         .file_stem()
         .unwrap_or_default()
@@ -79,12 +95,21 @@ fn parse_file(
         offset,
         |s| serde_json::from_str::<Line>(s).is_ok(),
         |line| {
-            if !line.contains("\"assistant\"") {
+            if !line.contains("\"assistant\"")
+                && !line.contains("slug")
+                && !line.contains("agent-name")
+            {
                 return;
             }
             let Ok(l) = serde_json::from_str::<Line>(line) else {
                 return;
             };
+            if let Some(s) = l.slug {
+                state.slug.get_or_insert(s);
+            }
+            if let Some(t) = l.agent_name {
+                state.title.get_or_insert(t);
+            }
             if l.kind.as_deref() != Some("assistant") {
                 return;
             }
@@ -115,6 +140,8 @@ fn parse_file(
             entries.push(CachedCall {
                 key,
                 session: dict.intern(l.session_id.as_deref().unwrap_or(&file_stem)),
+                // filled by `fixup` once the name record is seen
+                session_name: None,
                 model: dict.intern(&model),
                 ts: l
                     .timestamp
@@ -132,26 +159,40 @@ fn parse_file(
             });
         },
     )?;
-    Ok((consumed, dict.into_strings(), entries))
+    Ok((consumed, state, dict.into_strings(), entries))
 }
 
 impl Jsonl for Claude {
-    type State = ();
+    type State = State;
     const SOURCE: &'static str = "claude";
 
-    fn fresh(_path: &Path) {}
+    fn fresh(_path: &Path) -> State {
+        State::default()
+    }
 
     fn parse(
         path: &Path,
         offset: u64,
-        (): (),
+        state: State,
         dict: Vec<String>,
-    ) -> std::io::Result<(u64, (), Vec<String>, Vec<CachedCall>)> {
-        parse_file(path, offset, dict).map(|(c, d, e)| (c, (), d, e))
+    ) -> std::io::Result<(u64, State, Vec<String>, Vec<CachedCall>)> {
+        parse_file(path, offset, state, dict)
+    }
+
+    /// The session name may be discovered after calls were parsed — stamp
+    /// it onto every entry once the file tail is in.
+    fn fixup(e: &mut Entry<State>) {
+        let Some(name) = e.state.title.as_ref().or(e.state.slug.as_ref()) else {
+            return;
+        };
+        let i = filecache::dict_get_or_push(&mut e.dict, name);
+        for c in &mut e.entries {
+            c.session_name = Some(i);
+        }
     }
 }
 
-/// Live-capable scanner: first `tick` is the full incremental scan, later
+/// Monitor-capable scanner: first `tick` is the full incremental scan, later
 /// ticks emit only newly appended calls.
 pub type Scanner = filecache::Scanner<Claude>;
 
