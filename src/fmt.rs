@@ -49,6 +49,19 @@ pub fn money(x: f64) -> String {
     format!("{}${grouped}.{frac:02}", if neg { "-" } else { "" })
 }
 
+/// Human-readable energy: kWh in, "17.4 MWh" / "85.0 kWh" / "320 Wh" out.
+pub fn energy(kwh: f64) -> String {
+    if kwh >= 1e6 {
+        format!("{:.1} GWh", kwh / 1e6)
+    } else if kwh >= 1e3 {
+        format!("{:.1} MWh", kwh / 1e3)
+    } else if kwh >= 0.1 {
+        format!("{kwh:.1} kWh")
+    } else {
+        format!("{:.0} Wh", kwh * 1000.0)
+    }
+}
+
 /// "Sep 12 14:03" local time.
 pub fn datetime(ts: chrono::DateTime<chrono::Utc>) -> String {
     ts.with_timezone(&chrono::Local)

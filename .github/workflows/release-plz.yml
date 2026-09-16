@@ -3,7 +3,6 @@ name: release-plz
 on:
   push:
     branches: [main, dev]
-  workflow_dispatch:
 
 jobs:
   # Pushes git tag v{version} when Cargo.toml's version is unpublished.

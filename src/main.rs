@@ -1,9 +1,11 @@
+mod energy;
 mod fmt;
 mod monitor;
 mod pricing;
 mod render;
 mod report;
 mod sources;
+mod speedtest;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -72,11 +74,11 @@ struct Args {
 enum Cmd {
     /// Last 24 hours, per-hour timeline.
     #[command(visible_alias = "24h")]
-    Day,
+    Daily,
     /// Last 7 days, per-day timeline.
-    Week,
+    Weekly,
     /// Last 30 days, per-day timeline.
-    Month,
+    Monthly,
     /// All recorded history (default).
     All,
     /// Real-time monitor: rolling tok/s chart + per-session table (TUI).
@@ -84,6 +86,32 @@ enum Cmd {
         /// Refresh interval in milliseconds.
         #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
+    },
+    /// Live API benchmark: TTFT + decode tok/s for one model.
+    Speedtest {
+        /// Backend to probe.
+        provider: speedtest::ProviderKind,
+        /// Model family (e.g. swe-2, gemini-3.8-flash). Combined with
+        /// --effort into the resolved model uid — required so no expensive
+        /// tier is benchmarked by accident.
+        #[arg(long, required_unless_present = "list")]
+        model: Option<String>,
+        /// Reasoning tier suffix (e.g. low, medium, high, max, thinking).
+        /// Required for the same reason as --model.
+        #[arg(long, required_unless_present = "list")]
+        effort: Option<String>,
+        /// Prompt to send.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Number of measured runs.
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+        /// Output token cap for the request.
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        /// Print the provider's live model catalog and exit.
+        #[arg(long)]
+        list: bool,
     },
 }
 
@@ -184,7 +212,7 @@ fn spawn_overall_spinner<'scope, 'env>(
 /// usual progress UX, then hand off to the TUI loop.
 fn run_monitor(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
     let src = resolve_sources(args)?;
-    let mut rules = pricing::load_default_rules();
+    let (mut rules, _) = pricing::load_default_config();
     if let Some(p) = &args.pricing {
         rules.extend(pricing::load_rules(p)?);
     }
@@ -257,17 +285,28 @@ fn main() -> anyhow::Result<()> {
                 std::time::Duration::from_millis(interval_ms.max(200)),
             );
         }
-        Cmd::Day => (
+        Cmd::Speedtest {
+            provider,
+            model,
+            effort,
+            prompt,
+            runs,
+            max_tokens,
+            list,
+        } => {
+            return speedtest::run(provider, model, effort, prompt, runs, max_tokens, list);
+        }
+        Cmd::Daily => (
             "last 24h",
             Some(now - Duration::hours(24)),
             BucketKind::Hour,
         ),
-        Cmd::Week => (
+        Cmd::Weekly => (
             "last 7 days",
             Some(now - Duration::days(7)),
             BucketKind::Day,
         ),
-        Cmd::Month => (
+        Cmd::Monthly => (
             "last 30 days",
             Some(now - Duration::days(30)),
             BucketKind::Day,
@@ -275,9 +314,14 @@ fn main() -> anyhow::Result<()> {
         Cmd::All => ("all time", None, BucketKind::Auto),
     };
 
-    let mut rules = pricing::load_default_rules();
+    let (mut rules, mut energy_cfg) = pricing::load_default_config();
     if let Some(p) = &args.pricing {
-        rules.extend(pricing::load_rules(p)?);
+        let (extra, e) = pricing::load_config(p)?;
+        rules.extend(extra);
+        energy_cfg.params.extend(e.params);
+        if e.margin != energy::Energy::default().margin {
+            energy_cfg.margin = e.margin;
+        }
     }
     let src = resolve_sources(&args)?;
     let (wanted, explicit) = (&src.wanted, src.explicit);
@@ -355,7 +399,7 @@ fn main() -> anyhow::Result<()> {
         }
         let t0 = std::time::Instant::now();
         let n_calls = calls.len();
-        let report = report::build(calls, &book, since, bucket, coverage, warnings);
+        let report = report::build(calls, &book, &energy_cfg, since, bucket, coverage, warnings);
         tracing::debug!(n_calls, elapsed = ?t0.elapsed(), "report build");
         done.store(true, Ordering::Relaxed);
         report

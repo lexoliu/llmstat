@@ -127,6 +127,10 @@ pub struct Scanner {
     path: PathBuf,
     /// First row_id not yet scanned.
     next_rowid: i64,
+    /// First tick emits every cached (session, mid) once — the disk cache
+    /// holds rows, not emit state, so without this a warm start would drop
+    /// every previously scanned call from the report.
+    first: bool,
     /// All matched rows — persisted to the incremental cache on change.
     rows: Vec<RawRow>,
     /// (session, mid) -> (max ntp, earliest ts) dedup over `rows`.
@@ -185,6 +189,7 @@ impl Scanner {
             conn,
             path: path.to_path_buf(),
             next_rowid,
+            first: true,
             rows,
             best,
             emitted: HashSet::new(),
@@ -246,37 +251,49 @@ impl Scanner {
         Ok(out)
     }
 
-    /// Probe the high-water mark; on growth, scan the tail and return calls
-    /// whose (session, mid) first reached a nonzero token count. A node
-    /// pair whose metadata copy lands in a later tick emits then — same
-    /// totals as a one-shot run.
+    /// Probe the high-water mark; on growth, scan the tail. The first tick
+    /// emits every known (session, mid) with a nonzero count — cached rows
+    /// included; later ticks emit mids as they first reach one. A node pair
+    /// whose metadata copy lands in a later tick emits then — same totals
+    /// as a one-shot run.
     pub fn tick(&mut self, mp: &MultiProgress) -> Result<Vec<DbCall>> {
         let cur_max = max_rowid(&self.conn)?;
         let mut out = Vec::new();
-        if cur_max < self.next_rowid {
-            return Ok(out);
-        }
-        let new_rows = self.scan(self.next_rowid, cur_max + 1, mp)?;
-        self.next_rowid = cur_max + 1;
-        for r in new_rows {
-            let key = (r.session.clone(), r.mid.clone());
-            let e = self.best.entry(key.clone()).or_insert((0, i64::MAX));
-            e.0 = e.0.max(r.ntp);
-            e.1 = e.1.min(r.ts);
-            // Emit once a mid first shows a nonzero count — rows recorded
-            // without metadata (ntp=0) never produce a call, matching the
-            // one-shot path's `prompt == 0` skip.
-            if e.0 > 0 && self.emitted.insert(key) {
-                out.push(DbCall {
-                    session: r.session.clone(),
-                    ts: e.1,
-                    prompt: e.0,
-                });
+        if cur_max >= self.next_rowid {
+            let new_rows = self.scan(self.next_rowid, cur_max + 1, mp)?;
+            self.next_rowid = cur_max + 1;
+            for r in new_rows {
+                let key = (r.session.clone(), r.mid.clone());
+                let e = self.best.entry(key.clone()).or_insert((0, i64::MAX));
+                e.0 = e.0.max(r.ntp);
+                e.1 = e.1.min(r.ts);
+                // Emit once a mid first shows a nonzero count — rows recorded
+                // without metadata (ntp=0) never produce a call, matching the
+                // one-shot path's `prompt == 0` skip.
+                if !self.first && e.0 > 0 && self.emitted.insert(key) {
+                    out.push(DbCall {
+                        session: r.session.clone(),
+                        ts: e.1,
+                        prompt: e.0,
+                    });
+                }
+                self.rows.push(r);
             }
-            self.rows.push(r);
+            self.session_meta = session_meta(&self.conn)?;
+            cache::save(&self.path, cur_max, &self.rows);
         }
-        self.session_meta = session_meta(&self.conn)?;
-        cache::save(&self.path, cur_max, &self.rows);
+        if self.first {
+            self.first = false;
+            for ((session, mid), &(ntp, ts)) in &self.best {
+                if ntp > 0 && self.emitted.insert((session.clone(), mid.clone())) {
+                    out.push(DbCall {
+                        session: session.clone(),
+                        ts,
+                        prompt: ntp,
+                    });
+                }
+            }
+        }
         Ok(out)
     }
 }

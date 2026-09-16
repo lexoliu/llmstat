@@ -232,9 +232,27 @@ fn default_rules() -> Vec<Rule> {
     ]
 }
 
-#[derive(Deserialize)]
-struct RuleFile {
+#[derive(Deserialize, Default)]
+struct ConfigFile {
+    #[serde(default)]
     rule: Vec<RuleToml>,
+    energy: Option<EnergyToml>,
+    #[serde(default)]
+    param: Vec<ParamToml>,
+}
+
+#[derive(Deserialize)]
+struct EnergyToml {
+    /// Gross margin assumed when inverting list prices into energy.
+    margin: Option<f64>,
+}
+
+/// `[[param]] pattern active_b` — activated params (billions) for a model
+/// the built-in table doesn't know.
+#[derive(Deserialize)]
+struct ParamToml {
+    pattern: String,
+    active_b: f64,
 }
 
 #[derive(Deserialize)]
@@ -254,13 +272,10 @@ struct RuleToml {
     output: Option<f64>,
 }
 
-/// Load extra rules from a TOML file; they take precedence over built-ins.
-pub fn load_rules(path: &Path) -> Result<Vec<Rule>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read pricing file {}", path.display()))?;
-    let file: RuleFile =
-        toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))?;
-    Ok(file
+fn parse_config(text: &str, path: &Path) -> Result<(Vec<Rule>, crate::energy::Energy)> {
+    let file: ConfigFile =
+        toml::from_str(text).with_context(|| format!("invalid TOML in {}", path.display()))?;
+    let rules = file
         .rule
         .into_iter()
         .map(|r| Rule {
@@ -274,7 +289,30 @@ pub fn load_rules(path: &Path) -> Result<Vec<Rule>> {
                 output: r.output.unwrap_or(0.0),
             }),
         })
-        .collect())
+        .collect();
+    let mut energy = crate::energy::Energy::default();
+    if let Some(m) = file.energy.and_then(|e| e.margin) {
+        energy.margin = m;
+    }
+    energy.params = file
+        .param
+        .into_iter()
+        .map(|p| (normalize(&p.pattern), p.active_b))
+        .collect();
+    Ok((rules, energy))
+}
+
+/// Load rules (+ energy settings) from a TOML file; they take precedence
+/// over built-ins.
+pub fn load_config(path: &Path) -> Result<(Vec<Rule>, crate::energy::Energy)> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read pricing file {}", path.display()))?;
+    parse_config(&text, path)
+}
+
+/// Load extra rules from a TOML file; they take precedence over built-ins.
+pub fn load_rules(path: &Path) -> Result<Vec<Rule>> {
+    load_config(path).map(|(rules, _)| rules)
 }
 
 pub fn default_config_path() -> std::path::PathBuf {
@@ -284,11 +322,11 @@ pub fn default_config_path() -> std::path::PathBuf {
 }
 
 /// Load `~/.config/llmstat.toml` if it exists.
-pub fn load_default_rules() -> Vec<Rule> {
+pub fn load_default_config() -> (Vec<Rule>, crate::energy::Energy) {
     let p = default_config_path();
     if p.exists() {
-        load_rules(&p).unwrap_or_default()
+        load_config(&p).unwrap_or_default()
     } else {
-        Vec::new()
+        Default::default()
     }
 }

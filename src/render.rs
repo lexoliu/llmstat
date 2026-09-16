@@ -411,5 +411,32 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
             "note: unpriced models excluded from costs — add [[rule]] via --pricing or ~/.config/llmstat.toml\n",
         ));
     }
+
+    // ── did you know ────────────────────────────────────────────────────
+    let kwh = r.energy_j / 3.6e6;
+    if kwh > 0.0 {
+        let eqs = crate::energy::equivalences(kwh);
+        o.push_str(&format!(
+            "\n{}\n",
+            p.bold(format!(
+                "did you know? {} tokens ≈ {} of serving energy",
+                fmt::tokens(r.total.total()),
+                fmt::energy(kwh)
+            ))
+        ));
+        if !eqs.is_empty() {
+            o.push_str(&format!("  ≈ {}\n", p.dim(eqs.join(" · "))));
+        }
+        o.push_str(&format!(
+            "  ≈ {} at the US industrial rate (${}/kWh){}\n",
+            p.money(fmt::money(kwh * crate::energy::INDUSTRIAL_USD_KWH)),
+            crate::energy::INDUSTRIAL_USD_KWH,
+            if r.energy_inferred {
+                p.dim("   · order-of-magnitude estimate — some models' energy is inferred from list price")
+            } else {
+                p.dim("   · order-of-magnitude estimate")
+            }
+        ));
+    }
     o
 }

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/lexoliu/llmstat/compare/v0.2.2...v0.2.3) - 2026-09-13
+
+### Added
+
+- rename report subcommands to daily/weekly/monthly
+- "did you know" energy footer on report commands
+
+### Fixed
+
+- *(devin)* emit cached sessions.db calls on first tick ([#45](https://github.com/lexoliu/llmstat/pull/45))
+- *(monitor)* white session text, O(1) hit test, unstarvable ticks ([#38](https://github.com/lexoliu/llmstat/pull/38))
+
+### Other
+
+- *(readme)* plain rewrite, transparent screenshot ([#42](https://github.com/lexoliu/llmstat/pull/42))
+- *(readme)* badges, monitor screenshot, features list ([#40](https://github.com/lexoliu/llmstat/pull/40))
+- update install section for dist-built releases
+
 ## [0.2.2](https://github.com/lexoliu/llmstat/compare/v0.2.1...v0.2.2) - 2026-09-13
 
 ### Other

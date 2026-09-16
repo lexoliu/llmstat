@@ -5,6 +5,7 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use crate::energy::{Basis, Energy};
 use crate::pricing::{Price, PriceBook, Pricing, Resolved};
 
 /// Token usage for a single call or aggregate. `input` is the *uncached*
@@ -130,12 +131,18 @@ pub struct Report {
     pub latest: Option<DateTime<Utc>>,
     /// True when any call's token split was estimated rather than recorded.
     pub has_estimated: bool,
+    /// Estimated serving energy of all included calls, in joules.
+    pub energy_j: f64,
+    /// True when any model's energy came from price inversion or the
+    /// generic fallback rather than architecture parameters.
+    pub energy_inferred: bool,
 }
 
 /// Fold `calls` into a `Report`, keeping only events at/after `since`.
 pub fn build(
     calls: Vec<Call>,
     book: &PriceBook,
+    energy: &Energy,
     since: Option<DateTime<Utc>>,
     bucket: BucketKind,
     coverage: Vec<String>,
@@ -155,6 +162,8 @@ pub fn build(
         earliest: None,
         latest: None,
         has_estimated: false,
+        energy_j: 0.0,
+        energy_inferred: false,
     };
     // (source, model label) -> index into report.models
     let mut model_idx: BTreeMap<(&'static str, Arc<str>), usize> = BTreeMap::new();
@@ -166,6 +175,8 @@ pub fn build(
     // calls, so resolve once per distinct name instead of per call
     let mut resolved_list: Vec<Resolved> = Vec::new();
     let mut label_arc: Vec<Arc<str>> = Vec::new();
+    // energy J/token memoized per resolved model — same slot as `resolved`
+    let mut energy_rate: Vec<crate::energy::Rate> = Vec::new();
     let mut resolve_idx: HashMap<Arc<str>, usize> = HashMap::new();
 
     for ev in calls {
@@ -178,11 +189,15 @@ pub fn build(
         let usage = ev.usage;
         let ridx = *resolve_idx.entry(ev.model.clone()).or_insert_with(|| {
             let r = book.resolve(&ev.model);
+            energy_rate.push(energy.rate(&ev.model, &r));
             label_arc.push(r.label.as_str().into());
             resolved_list.push(r);
             resolved_list.len() - 1
         });
         let resolved = &resolved_list[ridx];
+        let rate = energy_rate[ridx];
+        report.energy_j += energy.joules(&usage, rate);
+        report.energy_inferred |= rate.basis != Basis::Params;
         let step_cost = resolved.price.as_ref().map(|p| usage.cost(p));
         let step_paid = matches!(resolved.pricing, Pricing::Paid);
 

@@ -405,14 +405,17 @@ enum Hit {
 }
 
 /// What is under `(x, y)` right now — shared by click and hover handling.
-fn hit_test(frame: Rect, x: u16, y: u16, st: &State, sort: (Col, Dir), now: i64) -> Option<Hit> {
+/// `rows` is the on-screen order produced by the last `draw`, so a hit
+/// always lands on exactly what the user sees (and lookup is O(1) — no
+/// re-sort per mouse event).
+fn hit_test(frame: Rect, x: u16, y: u16, rows: &[(&'static str, Arc<str>)]) -> Option<Hit> {
     if let Some(c) = header_hit(frame, x, y) {
         return Some(Hit::Header(c));
     }
     let (_, t, _) = areas(frame);
     // top border + header occupy the first two lines
     let i = y.checked_sub(t.y + 2)? as usize;
-    if y < t.y || i >= st.rows.len().min(t.height.saturating_sub(2) as usize) {
+    if y < t.y || i >= rows.len().min(t.height.saturating_sub(2) as usize) {
         return None;
     }
     let body = Rect::new(t.x, t.y + 1, t.width, t.height - 1);
@@ -422,8 +425,8 @@ fn hit_test(frame: Rect, x: u16, y: u16, st: &State, sort: (Col, Dir), now: i64)
     if COLS[col].0 != Col::Session {
         return None;
     }
-    let v = sorted_views(st, sort, now).into_iter().nth(i)?;
-    Some(Hit::Session(v.source, v.session))
+    let (s, id) = rows.get(i)?;
+    Some(Hit::Session(s, id.clone()))
 }
 
 /// `LAST` column: "MM-DD HH:MM" in local time.
@@ -434,6 +437,8 @@ fn last_cell(ts: i64) -> String {
     }
 }
 
+/// Renders one frame and fills `row_keys` with the displayed
+/// (source, session) order for O(1) mouse hit-testing until next draw.
 fn draw(
     f: &mut Frame,
     st: &State,
@@ -441,6 +446,7 @@ fn draw(
     sort: (Col, Dir),
     toggled: &std::collections::HashSet<(&'static str, Arc<str>)>,
     hover: Option<&Hit>,
+    row_keys: &mut Vec<(&'static str, Arc<str>)>,
 ) {
     let now = Utc::now().timestamp();
     let (chart_a, table_a, foot_a) = areas(f.area());
@@ -500,6 +506,8 @@ fn draw(
 
     // ── per-session table ─────────────────────────────────────────────
     let views = sorted_views(st, sort, now);
+    row_keys.clear();
+    row_keys.extend(views.iter().map(|v| (v.source, v.session.clone())));
     let (col, dir) = sort;
     let num = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
     let body = views.iter().map(|v| {
@@ -531,11 +539,15 @@ fn draw(
         };
         let hovered =
             matches!(hover, Some(Hit::Session(s, id)) if *s == v.source && id == &v.session);
-        // hover = full opacity, rest dimmed one step
-        let session_cell = Cell::from(Span::styled(
-            shown.to_string(),
-            Style::default().fg(if hovered { Color::White } else { Color::Gray }),
-        ));
+        // white text; hover adds weight — intensity up, no underline
+        let session_style = if hovered {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let session_cell = Cell::from(Span::styled(shown.to_string(), session_style));
         TRow::new(vec![
             Cell::from(Span::styled(
                 v.source.to_string(),
@@ -654,12 +666,26 @@ pub fn run(
     let mut sort = (Col::Rate, Dir::Desc);
     // Rows whose SESSION cell shows the canonical id instead of the name.
     let mut toggled = std::collections::HashSet::new();
-    // Clickable element under the cursor — underline affordance.
+    // Clickable element under the cursor — hover affordance.
     let mut hover: Option<Hit> = None;
+    // (source, session) in displayed order, refreshed by every draw.
+    let mut row_keys: Vec<(&'static str, Arc<str>)> = Vec::new();
+    // Scanner ticks keep their own schedule: mouse events redraw
+    // immediately but must not postpone the next data refresh.
+    let mut next_tick = Instant::now() + interval;
     'outer: loop {
-        term.draw(|f| draw(f, &st, interval, sort, &toggled, hover.as_ref()))?;
-        let deadline = Instant::now() + interval;
-        while event::poll(deadline.saturating_duration_since(Instant::now()))? {
+        term.draw(|f| {
+            draw(
+                f,
+                &st,
+                interval,
+                sort,
+                &toggled,
+                hover.as_ref(),
+                &mut row_keys,
+            )
+        })?;
+        while event::poll(next_tick.saturating_duration_since(Instant::now()))? {
             match event::read()? {
                 Event::Key(k)
                     if k.kind == KeyEventKind::Press
@@ -673,7 +699,7 @@ pub fn run(
                 Event::Mouse(m) if m.kind == MouseEventKind::Moved => {
                     let size = term.size()?;
                     let frame = Rect::new(0, 0, size.width, size.height);
-                    let hit = hit_test(frame, m.column, m.row, &st, sort, Utc::now().timestamp());
+                    let hit = hit_test(frame, m.column, m.row, &row_keys);
                     if hit != hover {
                         hover = hit;
                         continue 'outer;
@@ -682,7 +708,7 @@ pub fn run(
                 Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
                     let size = term.size()?;
                     let frame = Rect::new(0, 0, size.width, size.height);
-                    match hit_test(frame, m.column, m.row, &st, sort, Utc::now().timestamp()) {
+                    match hit_test(frame, m.column, m.row, &row_keys) {
                         Some(Hit::Header(c)) => {
                             sort = if sort.0 == c {
                                 (c, sort.1.flip())
@@ -703,7 +729,15 @@ pub fn run(
                 }
                 _ => {}
             }
+            // A flooded event queue must not starve the data tick.
+            if Instant::now() >= next_tick {
+                break;
+            }
         }
+        if Instant::now() < next_tick {
+            continue;
+        }
+        next_tick = Instant::now() + interval;
         for sc in scanners.iter_mut() {
             match sc.tick(&hidden) {
                 Ok(calls) => {
