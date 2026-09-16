@@ -5,6 +5,7 @@ mod pricing;
 mod render;
 mod report;
 mod sources;
+mod speedtest;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -85,6 +86,32 @@ enum Cmd {
         /// Refresh interval in milliseconds.
         #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
+    },
+    /// Live API benchmark: TTFT + decode tok/s for one model.
+    Speedtest {
+        /// Backend to probe.
+        provider: speedtest::ProviderKind,
+        /// Model family (e.g. swe-2, gemini-3.8-flash). Combined with
+        /// --effort into the resolved model uid — required so no expensive
+        /// tier is benchmarked by accident.
+        #[arg(long, required_unless_present = "list")]
+        model: Option<String>,
+        /// Reasoning tier suffix (e.g. low, medium, high, max, thinking).
+        /// Required for the same reason as --model.
+        #[arg(long, required_unless_present = "list")]
+        effort: Option<String>,
+        /// Prompt to send.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Number of measured runs.
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+        /// Output token cap for the request.
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        /// Print the provider's live model catalog and exit.
+        #[arg(long)]
+        list: bool,
     },
 }
 
@@ -257,6 +284,17 @@ fn main() -> anyhow::Result<()> {
                 &args,
                 std::time::Duration::from_millis(interval_ms.max(200)),
             );
+        }
+        Cmd::Speedtest {
+            provider,
+            model,
+            effort,
+            prompt,
+            runs,
+            max_tokens,
+            list,
+        } => {
+            return speedtest::run(provider, model, effort, prompt, runs, max_tokens, list);
         }
         Cmd::Daily => (
             "last 24h",
