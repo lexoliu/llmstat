@@ -299,6 +299,7 @@ impl Provider for Devin {
             ttft: ttft.context("stream ended without any content delta")?,
             total: t0.elapsed(),
             output_tokens: output,
+            thinking_tokens: None,
             input_tokens: input,
             cache_read_tokens: cache_read,
             stop,

@@ -36,9 +36,13 @@ pub struct RunStats {
     pub ttft: Duration,
     /// Whole request duration.
     pub total: Duration,
-    /// Billed/visible output tokens (including hidden thinking when the
-    /// backend counts them).
+    /// Output tokens that actually streamed during the decode window — what
+    /// the tok/s rate divides by.
     pub output_tokens: u64,
+    /// Reasoning tokens generated before streaming began, when the provider
+    /// reports them separately. Excluded from the tok/s rate since they were
+    /// produced inside the TTFT window.
+    pub thinking_tokens: Option<u64>,
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
     /// Provider stop/finish reason, if reported.
@@ -184,7 +188,14 @@ pub fn run(
                 .map(|t| format!(" [srv {:.2}s]", t))
                 .unwrap_or_default(),
             decode.as_secs_f64(),
-            fmt_tok(s.output_tokens),
+            format!(
+                "{}{}",
+                fmt_tok(s.output_tokens),
+                s.thinking_tokens
+                    .filter(|t| *t > 0)
+                    .map(|t| format!(" (+{t} think)"))
+                    .unwrap_or_default()
+            ),
             tps,
             fmt_tok(s.input_tokens),
             fmt_tok(s.cache_read_tokens),
