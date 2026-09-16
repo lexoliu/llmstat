@@ -938,6 +938,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "uuid",
  "walkdir",
  "xxhash-rust",
 ]

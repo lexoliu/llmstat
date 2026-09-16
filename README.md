@@ -57,6 +57,9 @@ llmstat daily           # last 24 hours, hourly timeline  (alias: 24h)
 llmstat weekly          # last 7 days, daily timeline
 llmstat monthly         # last 30 days, daily timeline
 llmstat monitor         # real-time monitor: rolling tok/s chart + per-session table
+llmstat speedtest devin --model swe-2 --effort max --runs 3
+llmstat speedtest antigravity --model gemini-3.8-flash --effort low
+llmstat speedtest devin --list   # live model catalog
 ```
 
 `monitor` polls the append-only logs (default 1s, `--interval-ms` floor 200ms)
@@ -66,6 +69,14 @@ prompt); clicking the SESSION cell toggles that row to its canonical id.
 Clicking a column header sorts the table — default is rate descending, then
 last activity. Tokens appear when an API call completes, which is when the
 CLIs write usage to disk. Quit with `q`, `Esc`, or `Ctrl-C`.
+
+`speedtest` fires live inference calls and reports TTFT, decode tok/s, and
+token usage per run. `--model` and `--effort` are both required and resolved
+against the provider's live catalog (`<model>-<effort>` → uid), so an
+expensive tier can never be probed by accident. Providers: `devin` (the CLI's
+own Connect-RPC backend, any model your plan exposes) and `antigravity`
+(Google Cloud Code Assist, using the local `antigravity-cli` or CLIProxyAPI
+credentials).
 
 ```
 llmstat --sources devin,claude      # read only these sources

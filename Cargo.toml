@@ -25,6 +25,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "3"
+uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
