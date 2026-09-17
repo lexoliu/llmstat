@@ -80,6 +80,8 @@ credentials).
 
 ```
 llmstat --sources devin,claude      # read only these sources
+llmstat -f 'source:claude and not free'   # keep only matching calls
+llmstat weekly -f 'model~opus'      # works on reports and `monitor`
 llmstat --devin-transcripts DIR     # override ~/.local/share/devin/cli/transcripts
 llmstat --devin-db FILE             # override the sessions.db path
 llmstat --devin-transcripts-only    # skip sessions.db (transcripts only)
@@ -91,6 +93,37 @@ llmstat --refresh-prices            # re-fetch the LiteLLM pricebook
 
 Without `--sources`, every source whose data directory exists is read; the
 three scans run concurrently.
+
+## Filters
+
+`--filter`/`-f` keeps only matching calls — reports, timeline, costs, and
+energy all reflect the subset. Repeatable; multiple filters are ANDed. A
+bare word means `model~word`.
+
+```sh
+llmstat -f 'opus'                          # model contains "opus"
+llmstat -f 'source:claude and model~opus'
+llmstat -f 'not free'                      # only paid models
+llmstat -f 'tokens>100k or cost>0.5'
+llmstat weekly -f 'date>=2026-09-01' -f 'family:swe-2'
+```
+
+| field | matches | ops |
+|---|---|---|
+| `model` | raw model name | `=` `!=` `~` `:` `!~` `!:` |
+| `family` | resolved pricing label | same |
+| `source` | `devin`/`claude`/`codex` | same |
+| `session` | session id or title | same |
+| `tokens` `input` `cached` `output` | per-call counts (`1k`/`2m`/`3b`) | `< <= = != >= >` |
+| `cost` | per-call list-price USD | same |
+| `date` | `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, RFC3339, `today`, `yesterday`, `12h`/`7d`/`2w` | same |
+| `estimated` `free` `paid` `unpriced` | flags | bare, or `= true/false` |
+
+`=`/`!=` are exact after normalization (lowercase, non-alnum → `-`), so
+`model=swe-2-max` matches `SWE-2 Max`; `~`/`:` are substring. Combine with
+`and`/`or`/`not` (also `&&`/`||`/`!`) and parens; adjacent predicates AND.
+Day-grained dates span the whole local day: `date=2026-09-11` matches that
+day, `date>2026-09-11` starts the day after.
 
 ## Sample output (daily)
 

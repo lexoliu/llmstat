@@ -134,7 +134,7 @@ impl PriceBook {
 /// Rules matched in order — specific patterns before generic ones. Explicit
 /// prices are public API list prices (USD / 1M tokens) used when the `as`
 /// key isn't in the LiteLLM book.
-fn default_rules() -> Vec<Rule> {
+pub(crate) fn default_rules() -> Vec<Rule> {
     let r = |pattern: &str,
              label: &str,
              free: bool,

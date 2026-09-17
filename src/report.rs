@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::energy::{Basis, Energy};
+use crate::filter::{Filter, Verdict};
 use crate::pricing::{Price, PriceBook, Pricing, Resolved};
 
 /// Token usage for a single call or aggregate. `input` is the *uncached*
@@ -138,16 +139,26 @@ pub struct Report {
     pub energy_inferred: bool,
 }
 
-/// Fold `calls` into a `Report`, keeping only events at/after `since`.
+/// Which calls enter the report and how the timeline is sliced.
+pub struct Spec<'a> {
+    /// Drop calls older than this.
+    pub since: Option<DateTime<Utc>>,
+    pub bucket: BucketKind,
+    /// `--filter` expression; only matching calls are folded in.
+    pub filter: Option<&'a Filter>,
+}
+
+/// Fold `calls` into a `Report`, per `spec`.
 pub fn build(
     calls: Vec<Call>,
     book: &PriceBook,
     energy: &Energy,
-    since: Option<DateTime<Utc>>,
-    bucket: BucketKind,
+    spec: Spec<'_>,
     coverage: Vec<String>,
     warnings: Vec<String>,
 ) -> Report {
+    let since = spec.since;
+    let bucket = spec.bucket;
     let mut report = Report {
         models: Vec::new(),
         sessions: Vec::new(),
@@ -178,6 +189,9 @@ pub fn build(
     // energy J/token memoized per resolved model — same slot as `resolved`
     let mut energy_rate: Vec<crate::energy::Rate> = Vec::new();
     let mut resolve_idx: HashMap<Arc<str>, usize> = HashMap::new();
+    // Any call that passed the `since` bound — distinguishes "filter
+    // matched nothing" from "no data in range".
+    let mut in_range = false;
 
     for ev in calls {
         if let (Some(c), Some(t)) = (since, ev.ts)
@@ -185,7 +199,7 @@ pub fn build(
         {
             continue;
         }
-        report.has_estimated |= ev.estimated;
+        in_range = true;
         let usage = ev.usage;
         let ridx = *resolve_idx.entry(ev.model.clone()).or_insert_with(|| {
             let r = book.resolve(&ev.model);
@@ -195,6 +209,12 @@ pub fn build(
             resolved_list.len() - 1
         });
         let resolved = &resolved_list[ridx];
+        if let Some(f) = spec.filter
+            && f.eval(&ev, Some(resolved)) == Verdict::Fail
+        {
+            continue;
+        }
+        report.has_estimated |= ev.estimated;
         let rate = energy_rate[ridx];
         report.energy_j += energy.joules(&usage, rate);
         report.energy_inferred |= rate.basis != Basis::Params;
@@ -312,6 +332,9 @@ pub fn build(
         } else {
             report.has_unpriced = true;
         }
+    }
+    if report.total_calls == 0 && in_range && spec.filter.is_some() {
+        report.warnings.push("filter matched no calls".to_string());
     }
 
     // resolve Auto and build the final ordered bucket list, filling gaps

@@ -1,4 +1,5 @@
 mod energy;
+mod filter;
 mod fmt;
 mod monitor;
 mod pricing;
@@ -68,6 +69,18 @@ struct Args {
     /// Re-fetch the LiteLLM pricebook even if the cache is fresh.
     #[arg(long, global = true)]
     refresh_prices: bool,
+
+    /// Keep only calls matching EXPR (repeatable — multiple filters are
+    /// ANDed). Predicates: model~pat, model=name, family~pat, source=name,
+    /// session~pat, tokens>N, input>N, cached>N, output>N, cost>USD, and
+    /// the flags estimated/free/paid/unpriced. `~`/`:` is a normalized
+    /// substring match, `=` exact; numbers take k/m/b suffixes; `date`
+    /// takes YYYY-MM-DD, YYYY-MM-DDTHH:MM, RFC3339, today/yesterday, or a
+    /// relative offset like 12h/7d/2w. Combine with and/or/not, &&/||/!,
+    /// and parens; adjacent predicates AND; a bare word means model~word.
+    /// Example: -f 'source:claude and model~opus and not free'
+    #[arg(long, short = 'f', value_name = "EXPR", global = true)]
+    filter: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -210,7 +223,11 @@ fn spawn_overall_spinner<'scope, 'env>(
 
 /// `llmstat monitor`: build resident scanners, take one full tick with the
 /// usual progress UX, then hand off to the TUI loop.
-fn run_monitor(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
+fn run_monitor(
+    args: &Args,
+    filter: Option<&filter::Filter>,
+    interval: std::time::Duration,
+) -> anyhow::Result<()> {
     let src = resolve_sources(args)?;
     let (mut rules, _) = pricing::load_default_config();
     if let Some(p) = &args.pricing {
@@ -257,14 +274,17 @@ fn run_monitor(args: &Args, interval: std::time::Duration) -> anyhow::Result<()>
         }
         let litellm = litellm_h.join().expect("litellm price load panicked");
         let book = PriceBook::new(rules, litellm);
-        state.apply(std::mem::take(&mut all), &book);
+        state.apply(std::mem::take(&mut all), &book, filter);
         if !status.is_empty() {
             state.set_status(status.join("  ·  "));
         }
         done.store(true, Ordering::Relaxed);
         book
     });
-    monitor::run(&mut scanners, state, &book, interval)
+    if let Some(f) = filter {
+        state.set_filter(f.raw().join(" and "));
+    }
+    monitor::run(&mut scanners, state, &book, filter, interval)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -277,11 +297,13 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let mut args = Args::parse();
+    let filter = filter::Filter::parse(&args.filter)?;
     let now = Utc::now();
     let (desc, since, bucket) = match args.cmd.take().unwrap_or(Cmd::All) {
         Cmd::Monitor { interval_ms } => {
             return run_monitor(
                 &args,
+                filter.as_ref(),
                 std::time::Duration::from_millis(interval_ms.max(200)),
             );
         }
@@ -394,12 +416,28 @@ fn main() -> anyhow::Result<()> {
         let book = PriceBook::new(rules, litellm);
 
         coverage.push(format!("prices: {}", book.source_note));
+        if let Some(f) = &filter {
+            for e in f.raw() {
+                coverage.push(format!("filter: {e}"));
+            }
+        }
         if calls.is_empty() {
             warnings.push("no usage data found".to_string());
         }
         let t0 = std::time::Instant::now();
         let n_calls = calls.len();
-        let report = report::build(calls, &book, &energy_cfg, since, bucket, coverage, warnings);
+        let report = report::build(
+            calls,
+            &book,
+            &energy_cfg,
+            report::Spec {
+                since,
+                bucket,
+                filter: filter.as_ref(),
+            },
+            coverage,
+            warnings,
+        );
         tracing::debug!(n_calls, elapsed = ?t0.elapsed(), "report build");
         done.store(true, Ordering::Relaxed);
         report
