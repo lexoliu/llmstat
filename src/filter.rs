@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use clap_complete::CompletionCandidate;
 
 use crate::pricing::{self, Pricing, Resolved};
 use crate::report::Call;
@@ -752,6 +753,139 @@ impl Filter {
             },
         }
     }
+}
+
+/// `(name, help)` for fields and flags, used by the dynamic completer.
+const FIELDS: &[(&str, &str)] = &[
+    ("model", "raw model name"),
+    ("family", "resolved pricing label"),
+    ("source", "devin | claude | codex"),
+    ("session", "session id or title"),
+    ("date", "call timestamp"),
+    ("tokens", "total tokens per call"),
+    ("input", "uncached input tokens"),
+    ("cached", "cache-read tokens"),
+    ("output", "output tokens"),
+    ("cost", "list-price cost of the call"),
+];
+const FLAGS: &[(&str, &str)] = &[
+    ("estimated", "token split was estimated"),
+    ("free", "free in the CLI"),
+    ("paid", "billed model"),
+    ("unpriced", "no matching price"),
+];
+
+fn candidate(text: String, help: &str) -> CompletionCandidate {
+    let c = CompletionCandidate::new(text);
+    if help.is_empty() {
+        c
+    } else {
+        c.help(Some(help.to_string().into()))
+    }
+}
+
+/// Values a field can take — for the completer's value position.
+fn value_candidates(f: Field) -> Vec<(String, &'static str)> {
+    match f {
+        Field::Str(StrField::Source) => vec![
+            ("devin".into(), "Devin CLI"),
+            ("claude".into(), "Claude Code"),
+            ("codex".into(), "Codex CLI"),
+        ],
+        Field::Str(StrField::Model) | Field::Str(StrField::Family) => {
+            // Real labels from the user's pricing rules and the built-ins —
+            // normalized, which is the shape `model`/`family` match against.
+            let (mut rules, _) = pricing::load_default_config();
+            rules.extend(pricing::default_rules());
+            rules
+                .iter()
+                .map(|r| (pricing::normalize(&r.label), "pricing rule"))
+                .collect()
+        }
+        Field::When => vec![
+            ("now".into(), "this instant"),
+            ("today".into(), "local midnight today"),
+            ("yesterday".into(), "local midnight yesterday"),
+            ("24h".into(), "24 hours ago"),
+            ("7d".into(), "7 days ago"),
+            ("30d".into(), "30 days ago"),
+        ],
+        Field::Flag(_) => vec![("true".into(), ""), ("false".into(), "")],
+        _ => Vec::new(),
+    }
+}
+
+/// `--filter` value completer (dynamic shell completion). The argument is
+/// the whole expression, so candidates are full-expression strings with
+/// the word under the cursor replaced: fields/flags/`not`/`and`/`or` in
+/// predicate position, known values after an operator.
+pub fn complete(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let Some(s) = current.to_str() else {
+        return Vec::new();
+    };
+    let bytes = s.as_bytes();
+    // The word under the cursor starts after the last separator. `!` only
+    // separates when it's `not`, not the `!=`/`!~`/`!:` operators.
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            _ if c.is_whitespace() => start = i + c.len_utf8(),
+            '(' | ')' | '&' | '|' => start = i + 1,
+            '!' if !matches!(bytes.get(i + 1), Some(b'=') | Some(b'~') | Some(b':')) => {
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let (base, tail) = s.split_at(start);
+
+    if let Some(pos) = tail.find(['=', '~', ':', '>', '<']) {
+        // Value position: `field<op>prefix` → complete field values.
+        let name = tail[..pos].to_lowercase();
+        let rest = &tail[pos..];
+        let op_len = rest
+            .find(|c: char| !matches!(c, '=' | '~' | ':' | '>' | '<' | '!'))
+            .unwrap_or(rest.len());
+        let vpre = rest[op_len..].to_lowercase();
+        let prefix = format!("{base}{}", &tail[..pos + op_len]);
+        let Some(f) = field(&name) else {
+            return Vec::new();
+        };
+        return value_candidates(f)
+            .into_iter()
+            .filter(|(v, _)| v.starts_with(&*vpre))
+            .map(|(v, h)| candidate(format!("{prefix}{v}"), h))
+            .collect();
+    }
+
+    // Predicate position.
+    let tl = tail.to_lowercase();
+    let mut pairs: Vec<(&'static str, &'static str)> =
+        FIELDS.iter().chain(FLAGS.iter()).copied().collect();
+    pairs.push(("not", "negate the next predicate"));
+    // `and`/`or` only make sense right after a complete predicate: `base`
+    // must not end in an opener (`(`, `!`, `&`, `|`) or a connective word.
+    let trimmed = base.trim_end();
+    let last_word = trimmed
+        .rsplit(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '&' | '|' | '!'))
+        .next()
+        .unwrap_or("");
+    if match trimmed.chars().last() {
+        Some(')') => true,
+        Some(c) => {
+            !matches!(c, '(' | '&' | '|' | '!')
+                && !matches!(last_word.to_lowercase().as_str(), "and" | "or" | "not")
+        }
+        None => false,
+    } {
+        pairs.push(("and", "both sides must match"));
+        pairs.push(("or", "either side matches"));
+    }
+    pairs
+        .into_iter()
+        .filter(|(n, _)| n.starts_with(&*tl))
+        .map(|(n, h)| candidate(format!("{base}{n}"), h))
+        .collect()
 }
 
 #[cfg(test)]

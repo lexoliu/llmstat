@@ -49,6 +49,32 @@ From source via crates.io:
 cargo install llmstat
 ```
 
+## Shell completions
+
+Dynamic completion — recommended; knows `--filter` fields and values
+(`source:` → devin/claude/codex, `date>` → today/yesterday/…,
+`model~` → your pricing labels) plus `speedtest --effort` tiers:
+
+```sh
+# zsh — add to ~/.zshrc
+source <(COMPLETE=zsh llmstat)
+
+# bash — add to ~/.bashrc
+source <(COMPLETE=bash llmstat)
+
+# fish — add to ~/.config/fish/config.fish
+COMPLETE=fish llmstat | source
+```
+
+Or generate a static script (subcommands, flags, `--sources` values, file
+hints — but no `--filter` expression smarts):
+
+```sh
+llmstat completions zsh > ~/.zfunc/_llmstat   # any dir in $fpath
+```
+
+`completions <shell>` supports bash, elvish, fish, powershell, and zsh.
+
 ## Usage
 
 ```

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{Duration, Utc};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::pricing::PriceBook;
@@ -36,16 +36,17 @@ struct Args {
         long,
         value_delimiter = ',',
         value_name = "devin,claude,codex",
+        value_parser = clap::builder::PossibleValuesParser::new(["devin", "claude", "codex"]),
         global = true
     )]
     sources: Vec<String>,
 
     /// Devin transcript directory.
-    #[arg(long, value_name = "DIR", global = true)]
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
     devin_transcripts: Option<PathBuf>,
 
     /// Devin sessions.db path (recovers calls missing from transcripts).
-    #[arg(long, value_name = "FILE", global = true)]
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath, global = true)]
     devin_db: Option<PathBuf>,
 
     /// Only count Devin transcript files; do not read sessions.db.
@@ -53,17 +54,17 @@ struct Args {
     devin_transcripts_only: bool,
 
     /// Claude projects directory (~/.claude/projects).
-    #[arg(long, value_name = "DIR", global = true)]
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
     claude_dir: Option<PathBuf>,
 
     /// Codex root directory (~/.codex) containing sessions/ and
     /// archived_sessions/.
-    #[arg(long, value_name = "DIR", global = true)]
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
     codex_dir: Option<PathBuf>,
 
     /// TOML file with extra [[rule]] pricing entries (takes precedence over
     /// LiteLLM and built-ins).
-    #[arg(long, value_name = "FILE", global = true)]
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath, global = true)]
     pricing: Option<PathBuf>,
 
     /// Re-fetch the LiteLLM pricebook even if the cache is fresh.
@@ -79,7 +80,13 @@ struct Args {
     /// relative offset like 12h/7d/2w. Combine with and/or/not, &&/||/!,
     /// and parens; adjacent predicates AND; a bare word means model~word.
     /// Example: -f 'source:claude and model~opus and not free'
-    #[arg(long, short = 'f', value_name = "EXPR", global = true)]
+    #[arg(
+        long,
+        short = 'f',
+        value_name = "EXPR",
+        add = clap_complete::ArgValueCompleter::new(crate::filter::complete),
+        global = true
+    )]
     filter: Vec<String>,
 }
 
@@ -111,7 +118,16 @@ enum Cmd {
         model: Option<String>,
         /// Reasoning tier suffix (e.g. low, medium, high, max, thinking).
         /// Required for the same reason as --model.
-        #[arg(long, required_unless_present = "list")]
+        #[arg(
+            long,
+            required_unless_present = "list",
+            add = clap_complete::ArgValueCandidates::new(|| {
+                ["low", "medium", "high", "max", "thinking"]
+                    .into_iter()
+                    .map(clap_complete::CompletionCandidate::new)
+                    .collect()
+            })
+        )]
         effort: Option<String>,
         /// Prompt to send.
         #[arg(long)]
@@ -125,6 +141,13 @@ enum Cmd {
         /// Print the provider's live model catalog and exit.
         #[arg(long)]
         list: bool,
+    },
+    /// Print a static shell completion script on stdout. For dynamic
+    /// completion (knows --filter fields and values) use
+    /// `source <(COMPLETE=zsh llmstat)` instead.
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
     },
 }
 
@@ -156,12 +179,6 @@ fn resolve_sources(args: &Args) -> anyhow::Result<Sources> {
             .map(|s| s.to_string())
             .collect()
     };
-    for s in &wanted {
-        if !["devin", "claude", "codex"].contains(&s.as_str()) {
-            anyhow::bail!("unknown source '{s}' (expected devin, claude, or codex)");
-        }
-    }
-
     let devin_dir = args
         .devin_transcripts
         .clone()
@@ -288,6 +305,11 @@ fn run_monitor(
 }
 
 fn main() -> anyhow::Result<()> {
+    // Dynamic completion dispatch: when the shell machinery calls back with
+    // COMPLETE=<shell>, this prints candidates/registration and exits.
+    // Must run before anything writes to stdout.
+    clap_complete::CompleteEnv::with_factory(Args::command).complete();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -317,6 +339,12 @@ fn main() -> anyhow::Result<()> {
             list,
         } => {
             return speedtest::run(provider, model, effort, prompt, runs, max_tokens, list);
+        }
+        Cmd::Completions { shell } => {
+            let mut cmd = Args::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            return Ok(());
         }
         Cmd::Daily => (
             "last 24h",

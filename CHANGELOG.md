@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `--filter`/`-f` expression filter over calls — model, family, source, session, date, token counts, cost, and free/paid/unpriced/estimated flags with and/or/not logic — for reports and `monitor`
+- shell completions: dynamic via `COMPLETE=<shell> llmstat` (completes `--filter` expressions and `speedtest --effort`), static scripts via `llmstat completions <shell>`
 
 ## [0.2.3](https://github.com/lexoliu/llmstat/compare/v0.2.2...v0.2.3) - 2026-09-13
 
