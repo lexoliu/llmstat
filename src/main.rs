@@ -1,4 +1,5 @@
 mod energy;
+mod filter;
 mod fmt;
 mod monitor;
 mod pricing;
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{Duration, Utc};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::pricing::PriceBook;
@@ -35,16 +36,17 @@ struct Args {
         long,
         value_delimiter = ',',
         value_name = "devin,claude,codex",
+        value_parser = clap::builder::PossibleValuesParser::new(["devin", "claude", "codex"]),
         global = true
     )]
     sources: Vec<String>,
 
     /// Devin transcript directory.
-    #[arg(long, value_name = "DIR", global = true)]
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
     devin_transcripts: Option<PathBuf>,
 
     /// Devin sessions.db path (recovers calls missing from transcripts).
-    #[arg(long, value_name = "FILE", global = true)]
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath, global = true)]
     devin_db: Option<PathBuf>,
 
     /// Only count Devin transcript files; do not read sessions.db.
@@ -52,22 +54,40 @@ struct Args {
     devin_transcripts_only: bool,
 
     /// Claude projects directory (~/.claude/projects).
-    #[arg(long, value_name = "DIR", global = true)]
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
     claude_dir: Option<PathBuf>,
 
     /// Codex root directory (~/.codex) containing sessions/ and
     /// archived_sessions/.
-    #[arg(long, value_name = "DIR", global = true)]
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
     codex_dir: Option<PathBuf>,
 
     /// TOML file with extra [[rule]] pricing entries (takes precedence over
     /// LiteLLM and built-ins).
-    #[arg(long, value_name = "FILE", global = true)]
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath, global = true)]
     pricing: Option<PathBuf>,
 
     /// Re-fetch the LiteLLM pricebook even if the cache is fresh.
     #[arg(long, global = true)]
     refresh_prices: bool,
+
+    /// Keep only calls matching EXPR (repeatable — multiple filters are
+    /// ANDed). Predicates: model~pat, model=name, family~pat, source=name,
+    /// session~pat, tokens>N, input>N, cached>N, output>N, cost>USD, and
+    /// the flags estimated/free/paid/unpriced. `~`/`:` is a normalized
+    /// substring match, `=` exact; numbers take k/m/b suffixes; `date`
+    /// takes YYYY-MM-DD, YYYY-MM-DDTHH:MM, RFC3339, today/yesterday, or a
+    /// relative offset like 12h/7d/2w. Combine with and/or/not, &&/||/!,
+    /// and parens; adjacent predicates AND; a bare word means model~word.
+    /// Example: -f 'source:claude and model~opus and not free'
+    #[arg(
+        long,
+        short = 'f',
+        value_name = "EXPR",
+        add = clap_complete::ArgValueCompleter::new(crate::filter::complete),
+        global = true
+    )]
+    filter: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -98,7 +118,16 @@ enum Cmd {
         model: Option<String>,
         /// Reasoning tier suffix (e.g. low, medium, high, max, thinking).
         /// Required for the same reason as --model.
-        #[arg(long, required_unless_present = "list")]
+        #[arg(
+            long,
+            required_unless_present = "list",
+            add = clap_complete::ArgValueCandidates::new(|| {
+                ["low", "medium", "high", "max", "thinking"]
+                    .into_iter()
+                    .map(clap_complete::CompletionCandidate::new)
+                    .collect()
+            })
+        )]
         effort: Option<String>,
         /// Prompt to send.
         #[arg(long)]
@@ -112,6 +141,13 @@ enum Cmd {
         /// Print the provider's live model catalog and exit.
         #[arg(long)]
         list: bool,
+    },
+    /// Print a static shell completion script on stdout. For dynamic
+    /// completion (knows --filter fields and values) use
+    /// `source <(COMPLETE=zsh llmstat)` instead.
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
     },
 }
 
@@ -143,12 +179,6 @@ fn resolve_sources(args: &Args) -> anyhow::Result<Sources> {
             .map(|s| s.to_string())
             .collect()
     };
-    for s in &wanted {
-        if !["devin", "claude", "codex"].contains(&s.as_str()) {
-            anyhow::bail!("unknown source '{s}' (expected devin, claude, or codex)");
-        }
-    }
-
     let devin_dir = args
         .devin_transcripts
         .clone()
@@ -210,7 +240,11 @@ fn spawn_overall_spinner<'scope, 'env>(
 
 /// `llmstat monitor`: build resident scanners, take one full tick with the
 /// usual progress UX, then hand off to the TUI loop.
-fn run_monitor(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
+fn run_monitor(
+    args: &Args,
+    filter: Option<&filter::Filter>,
+    interval: std::time::Duration,
+) -> anyhow::Result<()> {
     let src = resolve_sources(args)?;
     let (mut rules, _) = pricing::load_default_config();
     if let Some(p) = &args.pricing {
@@ -257,17 +291,25 @@ fn run_monitor(args: &Args, interval: std::time::Duration) -> anyhow::Result<()>
         }
         let litellm = litellm_h.join().expect("litellm price load panicked");
         let book = PriceBook::new(rules, litellm);
-        state.apply(std::mem::take(&mut all), &book);
+        state.apply(std::mem::take(&mut all), &book, filter);
         if !status.is_empty() {
             state.set_status(status.join("  ·  "));
         }
         done.store(true, Ordering::Relaxed);
         book
     });
-    monitor::run(&mut scanners, state, &book, interval)
+    if let Some(f) = filter {
+        state.set_filter(f.raw().join(" and "));
+    }
+    monitor::run(&mut scanners, state, &book, filter, interval)
 }
 
 fn main() -> anyhow::Result<()> {
+    // Dynamic completion dispatch: when the shell machinery calls back with
+    // COMPLETE=<shell>, this prints candidates/registration and exits.
+    // Must run before anything writes to stdout.
+    clap_complete::CompleteEnv::with_factory(Args::command).complete();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -277,11 +319,13 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let mut args = Args::parse();
+    let filter = filter::Filter::parse(&args.filter)?;
     let now = Utc::now();
     let (desc, since, bucket) = match args.cmd.take().unwrap_or(Cmd::All) {
         Cmd::Monitor { interval_ms } => {
             return run_monitor(
                 &args,
+                filter.as_ref(),
                 std::time::Duration::from_millis(interval_ms.max(200)),
             );
         }
@@ -295,6 +339,12 @@ fn main() -> anyhow::Result<()> {
             list,
         } => {
             return speedtest::run(provider, model, effort, prompt, runs, max_tokens, list);
+        }
+        Cmd::Completions { shell } => {
+            let mut cmd = Args::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            return Ok(());
         }
         Cmd::Daily => (
             "last 24h",
@@ -394,12 +444,28 @@ fn main() -> anyhow::Result<()> {
         let book = PriceBook::new(rules, litellm);
 
         coverage.push(format!("prices: {}", book.source_note));
+        if let Some(f) = &filter {
+            for e in f.raw() {
+                coverage.push(format!("filter: {e}"));
+            }
+        }
         if calls.is_empty() {
             warnings.push("no usage data found".to_string());
         }
         let t0 = std::time::Instant::now();
         let n_calls = calls.len();
-        let report = report::build(calls, &book, &energy_cfg, since, bucket, coverage, warnings);
+        let report = report::build(
+            calls,
+            &book,
+            &energy_cfg,
+            report::Spec {
+                since,
+                bucket,
+                filter: filter.as_ref(),
+            },
+            coverage,
+            warnings,
+        );
         tracing::debug!(n_calls, elapsed = ?t0.elapsed(), "report build");
         done.store(true, Ordering::Relaxed);
         report
