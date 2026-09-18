@@ -7,6 +7,7 @@ mod render;
 mod report;
 mod sources;
 mod speedtest;
+mod watch;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -105,6 +106,13 @@ enum Cmd {
     Monitor {
         /// Refresh interval in milliseconds.
         #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+    },
+    /// Watch every running agent's output live in a tiled grid — read-only,
+    /// one pane per session.
+    Watch {
+        /// Refresh interval in milliseconds.
+        #[arg(long, default_value_t = 500)]
         interval_ms: u64,
     },
     /// Live API benchmark: TTFT + decode tok/s for one model.
@@ -304,6 +312,46 @@ fn run_monitor(
     monitor::run(&mut scanners, state, &book, filter, interval)
 }
 
+/// `llmstat watch`: build live-output sources for the wanted CLIs and hand
+/// them to the tiled tail TUI.
+fn run_watch(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
+    let src = resolve_sources(args)?;
+    let mut feeds: Vec<Box<dyn watch::Source>> = Vec::new();
+    if src.wanted.contains("devin") {
+        match &src.devin_db {
+            Some(db) if db.exists() => feeds.push(Box::new(watch::Devin::open(db)?)),
+            _ if src.explicit => anyhow::bail!("devin: watch needs sessions.db"),
+            _ => {}
+        }
+    }
+    if src.wanted.contains("claude") {
+        // the pid registry sits next to the projects dir
+        let sessions = src
+            .claude_dir
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("sessions");
+        if sessions.exists() || src.explicit {
+            feeds.push(Box::new(watch::Claude::new(
+                sessions,
+                src.claude_dir.clone(),
+            )));
+        }
+    }
+    if src.wanted.contains("codex") && (src.codex_dirs.iter().any(|d| d.exists()) || src.explicit) {
+        let root = src
+            .codex_dirs
+            .first()
+            .and_then(|d| d.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_default();
+        feeds.push(Box::new(watch::Codex::new(src.codex_dirs.clone(), &root)));
+    }
+    if feeds.is_empty() {
+        anyhow::bail!("no live-agent sources found");
+    }
+    watch::run(feeds, interval)
+}
+
 fn main() -> anyhow::Result<()> {
     // Dynamic completion dispatch: when the shell machinery calls back with
     // COMPLETE=<shell>, this prints candidates/registration and exits.
@@ -326,6 +374,12 @@ fn main() -> anyhow::Result<()> {
             return run_monitor(
                 &args,
                 filter.as_ref(),
+                std::time::Duration::from_millis(interval_ms.max(200)),
+            );
+        }
+        Cmd::Watch { interval_ms } => {
+            return run_watch(
+                &args,
                 std::time::Duration::from_millis(interval_ms.max(200)),
             );
         }

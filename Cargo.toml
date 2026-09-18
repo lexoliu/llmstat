@@ -25,10 +25,15 @@ terminal_size = "0.4"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
 ureq = "3"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = true
