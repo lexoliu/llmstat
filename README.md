@@ -14,6 +14,8 @@ Codex CLI. Prices come from the LiteLLM pricebook. Pure Rust.
   the list price is struck through and the actual $0.00 is shown in green
 - `monitor` is a live TUI: rolling tokens/s chart plus a per-session table;
   click a column header to sort, click a session name to reveal its id
+- `watch` tails every running agent's output in a tiled grid — read-only,
+  one pane per session across Devin, Claude Code, and Codex
 - Each report estimates the energy behind the tokens (kWh and cost at the
   US industrial electricity rate)
 - All sources are cached incrementally; repeat runs only parse appended data
@@ -83,6 +85,7 @@ llmstat daily           # last 24 hours, hourly timeline  (alias: 24h)
 llmstat weekly          # last 7 days, daily timeline
 llmstat monthly         # last 30 days, daily timeline
 llmstat monitor         # real-time monitor: rolling tok/s chart + per-session table
+llmstat watch           # tiled live tails of every running agent (read-only)
 llmstat speedtest devin --model swe-2 --effort max --runs 3
 llmstat speedtest antigravity --model gemini-3.8-flash --effort low
 llmstat speedtest devin --list   # live model catalog
@@ -95,6 +98,17 @@ prompt); clicking the SESSION cell toggles that row to its canonical id.
 Clicking a column header sorts the table — default is rate descending, then
 last activity. Tokens appear when an API call completes, which is when the
 CLIs write usage to disk. Quit with `q`, `Esc`, or `Ctrl-C`.
+
+`watch` shows the output of every agent currently running — one tile per
+session, updating live (default 500ms, `--interval-ms` floor 200ms). It is
+strictly read-only: nothing is ever sent back to the agents. Liveness comes
+from the real signal each CLI exposes — held `flock`s for Devin, the pid
+registry for Claude Code, fresh rollout files for Codex. Panes of finished
+sessions linger briefly, then drop. The grid tops out at 24 tiles; beyond
+that the newest sessions wait for a slot so panes never reshuffle. Click a
+tile to zoom, scroll inside it with the wheel or
+`↑`/`↓`/`PgUp`/`PgDn`, cycle focus with `Tab`, set the column count with
+`-`/`+` (`0` = auto). Quit with `q`, `Esc`, or `Ctrl-C`.
 
 `speedtest` fires live inference calls and reports TTFT, decode tok/s, and
 token usage per run. `--model` and `--effort` are both required and resolved
