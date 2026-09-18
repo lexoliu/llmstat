@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/lexoliu/llmstat/compare/v0.2.3...v0.2.4) - 2026-09-18
+
+### Added
+
+- watch — tiled read-only tails of every running agent ([#60](https://github.com/lexoliu/llmstat/pull/60))
+- shell completions — dynamic + static script
+- --filter/-f expression filter over calls
+
+### Fixed
+
+- *(speedtest)* count antigravity thinking in TTFT, not decode tok/s ([#56](https://github.com/lexoliu/llmstat/pull/56))
+
+### Other
+
+- *(changelog)* drop hand-written Unreleased entries
+
 ## [0.2.3](https://github.com/lexoliu/llmstat/compare/v0.2.2...v0.2.3) - 2026-09-13
 
 ### Added
