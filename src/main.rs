@@ -5,6 +5,7 @@ mod monitor;
 mod pricing;
 mod render;
 mod report;
+mod serve;
 mod sources;
 mod speedtest;
 mod watch;
@@ -114,6 +115,16 @@ enum Cmd {
         /// Refresh interval in milliseconds.
         #[arg(long, default_value_t = 500)]
         interval_ms: u64,
+    },
+    /// Headless live-stats emitter: scans like `monitor` but writes a JSON
+    /// snapshot to a file every tick for external consumers.
+    Serve {
+        /// Emit interval in milliseconds.
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Snapshot path (default: ~/.cache/llmstat/live.json).
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
     },
     /// Live API benchmark: TTFT + decode tok/s for one model.
     Speedtest {
@@ -246,19 +257,9 @@ fn spawn_overall_spinner<'scope, 'env>(
     });
 }
 
-/// `llmstat monitor`: build resident scanners, take one full tick with the
-/// usual progress UX, then hand off to the TUI loop.
-fn run_monitor(
-    args: &Args,
-    filter: Option<&filter::Filter>,
-    interval: std::time::Duration,
-) -> anyhow::Result<()> {
-    let src = resolve_sources(args)?;
-    let (mut rules, _) = pricing::load_default_config();
-    if let Some(p) = &args.pricing {
-        rules.extend(pricing::load_rules(p)?);
-    }
-
+/// Build the resident scanners named by `--sources` (auto-detected when
+/// absent), failing when nothing is found.
+fn open_scanners(src: &Sources) -> anyhow::Result<Vec<sources::AnyScanner>> {
     let mut scanners: Vec<sources::AnyScanner> = Vec::new();
     if src.wanted.contains("devin") && (src.devin_dir.exists() || src.explicit) {
         scanners.push(sources::AnyScanner::devin(
@@ -274,6 +275,22 @@ fn run_monitor(
     }
     if scanners.is_empty() {
         anyhow::bail!("no usage data sources found");
+    }
+    Ok(scanners)
+}
+
+/// Shared preamble for live modes (monitor/serve): resolve sources, open
+/// resident scanners, run one full tick with the usual progress UX, and
+/// return the primed state plus the resolved price book.
+fn monitor_preamble(
+    args: &Args,
+    filter: Option<&filter::Filter>,
+) -> anyhow::Result<(Vec<sources::AnyScanner>, monitor::State, PriceBook)> {
+    let src = resolve_sources(args)?;
+    let mut scanners = open_scanners(&src)?;
+    let (mut rules, _) = pricing::load_default_config();
+    if let Some(p) = &args.pricing {
+        rules.extend(pricing::load_rules(p)?);
     }
 
     let mp = MultiProgress::new();
@@ -309,7 +326,39 @@ fn run_monitor(
     if let Some(f) = filter {
         state.set_filter(f.raw().join(" and "));
     }
+    Ok((scanners, state, book))
+}
+
+/// `llmstat monitor`: build resident scanners, take one full tick with the
+/// usual progress UX, then hand off to the TUI loop.
+fn run_monitor(
+    args: &Args,
+    filter: Option<&filter::Filter>,
+    interval: std::time::Duration,
+) -> anyhow::Result<()> {
+    let (mut scanners, state, book) = monitor_preamble(args, filter)?;
     monitor::run(&mut scanners, state, &book, filter, interval)
+}
+
+/// `llmstat serve`: same resident scanners as monitor, minus the TUI —
+/// every tick writes a JSON snapshot for external consumers.
+fn run_serve(
+    args: &Args,
+    filter: Option<&filter::Filter>,
+    interval: std::time::Duration,
+    out: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let claude_dir = resolve_sources(args).ok().map(|s| s.claude_dir);
+    let (mut scanners, state, book) = monitor_preamble(args, filter)?;
+    serve::run(
+        &mut scanners,
+        state,
+        &book,
+        filter,
+        interval,
+        out.as_deref().unwrap_or(&serve::default_out()),
+        claude_dir.filter(|d| d.exists()),
+    )
 }
 
 /// `llmstat watch`: build live-output sources for the wanted CLIs and hand
@@ -381,6 +430,14 @@ fn main() -> anyhow::Result<()> {
             return run_watch(
                 &args,
                 std::time::Duration::from_millis(interval_ms.max(200)),
+            );
+        }
+        Cmd::Serve { interval_ms, out } => {
+            return run_serve(
+                &args,
+                filter.as_ref(),
+                std::time::Duration::from_millis(interval_ms.max(200)),
+                out,
             );
         }
         Cmd::Speedtest {
