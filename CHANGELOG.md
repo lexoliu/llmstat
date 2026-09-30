@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   devin transcripts + a `sqlite3 .backup` snapshot of sessions.db); all
   reports and `monitor` count every mirrored host automatically,
   deduplicated against local data
+- `llmstat serve`: headless live-stats emitter — `monitor`'s scanners minus
+  the TUI, writing a JSON snapshot (tok/s windows, per-source rates, fresh
+  Claude usage-limit hits) to `~/.cache/llmstat/live.json` every tick
 
 ### Changed
 
