@@ -5,6 +5,7 @@ mod monitor;
 mod pricing;
 mod render;
 mod report;
+mod serve;
 mod sources;
 mod speedtest;
 mod sync;
@@ -119,6 +120,16 @@ enum Cmd {
         /// Refresh interval in milliseconds.
         #[arg(long, default_value_t = 500)]
         interval_ms: u64,
+    },
+    /// Headless live-stats emitter: scans like `monitor` but writes a JSON
+    /// snapshot to a file every tick for external consumers.
+    Serve {
+        /// Emit interval in milliseconds.
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Snapshot path (default: ~/.cache/llmstat/live.json).
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
     },
     /// Live API benchmark: TTFT + decode tok/s for one model.
     Speedtest {
@@ -320,19 +331,9 @@ fn spawn_overall_spinner<'scope, 'env>(
     });
 }
 
-/// `llmstat monitor`: build resident scanners, take one full tick with the
-/// usual progress UX, then hand off to the TUI loop.
-fn run_monitor(
-    args: &Args,
-    filter: Option<&filter::Filter>,
-    interval: std::time::Duration,
-) -> anyhow::Result<()> {
-    let src = resolve_sources(args)?;
-    let (mut rules, _) = pricing::load_default_config();
-    if let Some(p) = &args.pricing {
-        rules.extend(pricing::load_rules(p)?);
-    }
-
+/// Build the resident scanners named by `--sources` (auto-detected when
+/// absent), failing when nothing is found.
+fn open_scanners(src: &Sources) -> anyhow::Result<Vec<sources::AnyScanner>> {
     let devin_dbs: Vec<PathBuf> = src
         .devin_dbs
         .iter()
@@ -345,8 +346,7 @@ fn run_monitor(
     {
         scanners.push(sources::AnyScanner::devin(&src.devin_dirs, &devin_dbs)?);
     }
-    if src.wanted.contains("claude")
-        && (src.claude_dirs.iter().any(|d| d.exists()) || src.explicit)
+    if src.wanted.contains("claude") && (src.claude_dirs.iter().any(|d| d.exists()) || src.explicit)
     {
         scanners.push(sources::AnyScanner::claude(src.claude_dirs.clone()));
     }
@@ -355,6 +355,22 @@ fn run_monitor(
     }
     if scanners.is_empty() {
         anyhow::bail!("no usage data sources found");
+    }
+    Ok(scanners)
+}
+
+/// Shared preamble for live modes (monitor/serve): resolve sources, open
+/// resident scanners, run one full tick with the usual progress UX, and
+/// return the primed state plus the resolved price book.
+fn monitor_preamble(
+    args: &Args,
+    filter: Option<&filter::Filter>,
+) -> anyhow::Result<(Vec<sources::AnyScanner>, monitor::State, PriceBook)> {
+    let src = resolve_sources(args)?;
+    let mut scanners = open_scanners(&src)?;
+    let (mut rules, _) = pricing::load_default_config();
+    if let Some(p) = &args.pricing {
+        rules.extend(pricing::load_rules(p)?);
     }
 
     let mp = MultiProgress::new();
@@ -390,7 +406,41 @@ fn run_monitor(
     if let Some(f) = filter {
         state.set_filter(f.raw().join(" and "));
     }
+    Ok((scanners, state, book))
+}
+
+/// `llmstat monitor`: build resident scanners, take one full tick with the
+/// usual progress UX, then hand off to the TUI loop.
+fn run_monitor(
+    args: &Args,
+    filter: Option<&filter::Filter>,
+    interval: std::time::Duration,
+) -> anyhow::Result<()> {
+    let (mut scanners, state, book) = monitor_preamble(args, filter)?;
     monitor::run(&mut scanners, state, &book, filter, interval)
+}
+
+/// `llmstat serve`: same resident scanners as monitor, minus the TUI —
+/// every tick writes a JSON snapshot for external consumers.
+fn run_serve(
+    args: &Args,
+    filter: Option<&filter::Filter>,
+    interval: std::time::Duration,
+    out: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let claude_dir = resolve_sources(args)
+        .ok()
+        .and_then(|s| s.claude_dirs.first().cloned());
+    let (mut scanners, state, book) = monitor_preamble(args, filter)?;
+    serve::run(
+        &mut scanners,
+        state,
+        &book,
+        filter,
+        interval,
+        out.as_deref().unwrap_or(&serve::default_out()),
+        claude_dir.filter(|d| d.exists()),
+    )
 }
 
 /// `llmstat watch`: build live-output sources for the wanted CLIs and hand
@@ -419,9 +469,7 @@ fn run_watch(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
         }
     }
     let local_codex = sources::codex::dirs_for(&src.codex_root);
-    if src.wanted.contains("codex")
-        && (local_codex.iter().any(|d| d.exists()) || src.explicit)
-    {
+    if src.wanted.contains("codex") && (local_codex.iter().any(|d| d.exists()) || src.explicit) {
         feeds.push(Box::new(watch::Codex::new(local_codex, &src.codex_root)));
     }
     if feeds.is_empty() {
@@ -459,6 +507,14 @@ fn main() -> anyhow::Result<()> {
             return run_watch(
                 &args,
                 std::time::Duration::from_millis(interval_ms.max(200)),
+            );
+        }
+        Cmd::Serve { interval_ms, out } => {
+            return run_serve(
+                &args,
+                filter.as_ref(),
+                std::time::Duration::from_millis(interval_ms.max(200)),
+                out,
             );
         }
         Cmd::Speedtest {
@@ -530,8 +586,7 @@ fn main() -> anyhow::Result<()> {
         let claude_dirs = src.claude_dirs.clone();
         let codex_dirs = src.codex_dirs.clone();
         let codex_present = codex_dirs.iter().any(|d| d.exists());
-        let devin_present =
-            devin_dirs.iter().any(|d| d.exists()) || !devin_dbs.is_empty();
+        let devin_present = devin_dirs.iter().any(|d| d.exists()) || !devin_dbs.is_empty();
         let claude_present = claude_dirs.iter().any(|d| d.exists());
         let mp = &mp;
         vec![

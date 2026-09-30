@@ -194,7 +194,10 @@ fn pull_db(host: &str, dst: &Path) -> Result<()> {
 fn dir_size(dir: &Path) -> (usize, u64) {
     let mut files = 0;
     let mut bytes = 0;
-    for e in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+    for e in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if e.file_type().is_file()
             && let Ok(m) = e.metadata()
         {
@@ -227,15 +230,19 @@ pub fn run(host: &str) -> Result<()> {
                 continue;
             }
             let dst = root.join(part.local);
-            jobs.push((part.name, dst.clone(), s.spawn(move || {
-                rsync_pull(host, part.remote, &dst)
-            })));
+            jobs.push((
+                part.name,
+                dst.clone(),
+                s.spawn(move || rsync_pull(host, part.remote, &dst)),
+            ));
         }
         if present.iter().any(|p| p.ends_with(DB_REMOTE)) {
             let dst = root.join(DB_LOCAL);
-            jobs.push(("devin/sessions.db", dst.clone(), s.spawn(move || {
-                pull_db(host, &dst)
-            })));
+            jobs.push((
+                "devin/sessions.db",
+                dst.clone(),
+                s.spawn(move || pull_db(host, &dst)),
+            ));
         } else {
             println!("{:<20} not on {host}", "devin/sessions.db");
         }
@@ -244,7 +251,10 @@ pub fn run(host: &str) -> Result<()> {
         let mut ran = 0;
         for (name, dst, h) in jobs {
             ran += 1;
-            match h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("panicked"))) {
+            match h
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("panicked")))
+            {
                 Ok(()) => {
                     let (files, bytes) = dir_size(&dst);
                     println!(

@@ -16,6 +16,8 @@ Codex CLI. Prices come from the LiteLLM pricebook. Pure Rust.
   click a column header to sort, click a session name to reveal its id
 - `watch` tails every running agent's output in a tiled grid — read-only,
   one pane per session across Devin, Claude Code, and Codex
+- `serve` emits the same live stats headlessly — a JSON snapshot written
+  every tick for widgets, scripts, and other external consumers
 - Each report estimates the energy behind the tokens (kWh and cost at the
   US industrial electricity rate)
 - All sources are cached incrementally; repeat runs only parse appended data
@@ -86,6 +88,7 @@ llmstat weekly          # last 7 days, daily timeline
 llmstat monthly         # last 30 days, daily timeline
 llmstat monitor         # real-time monitor: rolling tok/s chart + per-session table
 llmstat watch           # tiled live tails of every running agent (read-only)
+llmstat serve           # headless: write live stats as JSON each tick
 llmstat sync my-other-mac  # mirror another machine's usage data over ssh
 llmstat speedtest devin --model swe-2 --effort max --runs 3
 llmstat speedtest antigravity --model gemini-3.8-flash --effort low
@@ -110,6 +113,13 @@ that the newest sessions wait for a slot so panes never reshuffle. Click a
 tile to zoom, scroll inside it with the wheel or
 `↑`/`↓`/`PgUp`/`PgDn`, cycle focus with `Tab`, set the column count with
 `-`/`+` (`0` = auto). Quit with `q`, `Esc`, or `Ctrl-C`.
+
+`serve` runs `monitor`'s resident scanners without the TUI: every tick it
+atomically rewrites a JSON snapshot (default `~/.cache/llmstat/live.json`,
+override with `--out`) carrying current tok/s over 5s/30s windows, a
+per-source breakdown, and the freshest Claude usage-limit hit it observed
+while tailing transcripts. External consumers read the file instead of
+scraping a terminal. `--interval-ms` works the same as `monitor`.
 
 `sync <host>` pulls another machine's usage data over ssh into a mirror at
 `~/.local/share/llmstat/hosts/<host>/` — the remote's `~/.claude/projects`,

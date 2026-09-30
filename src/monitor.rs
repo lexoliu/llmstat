@@ -244,12 +244,17 @@ impl State {
 
     /// Tokens/s across all sources, averaged over `secs`.
     fn rate(&self, secs: i64) -> f64 {
+        self.source_rates(secs).into_iter().map(|(_, v)| v).sum()
+    }
+
+    /// Per-source tokens/s averaged over `secs` — the same rolling window
+    /// the chart draws.
+    pub fn source_rates(&self, secs: i64) -> Vec<(&'static str, f64)> {
         let now = Utc::now().timestamp();
         self.series
-            .values()
-            .map(|r| r.sum_since(now - secs) as f64)
-            .sum::<f64>()
-            / secs as f64
+            .iter()
+            .map(|(s, r)| (*s, r.sum_since(now - secs) as f64 / secs as f64))
+            .collect()
     }
 }
 
