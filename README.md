@@ -86,6 +86,7 @@ llmstat weekly          # last 7 days, daily timeline
 llmstat monthly         # last 30 days, daily timeline
 llmstat monitor         # real-time monitor: rolling tok/s chart + per-session table
 llmstat watch           # tiled live tails of every running agent (read-only)
+llmstat sync my-other-mac  # mirror another machine's usage data over ssh
 llmstat speedtest devin --model swe-2 --effort max --runs 3
 llmstat speedtest antigravity --model gemini-3.8-flash --effort low
 llmstat speedtest devin --list   # live model catalog
@@ -109,6 +110,18 @@ that the newest sessions wait for a slot so panes never reshuffle. Click a
 tile to zoom, scroll inside it with the wheel or
 `↑`/`↓`/`PgUp`/`PgDn`, cycle focus with `Tab`, set the column count with
 `-`/`+` (`0` = auto). Quit with `q`, `Esc`, or `Ctrl-C`.
+
+`sync <host>` pulls another machine's usage data over ssh into a mirror at
+`~/.local/share/llmstat/hosts/<host>/` — the remote's `~/.claude/projects`,
+`~/.codex/{sessions,archived_sessions}`, Devin `transcripts/`, and a
+consistent `sqlite3 .backup` snapshot of `sessions.db`. Reports and
+`monitor` count every mirrored host automatically; the per-source
+dedup keys make overlap with local files (resumed sessions, hand-copied
+transcripts) count once. `watch` stays local-only — a mirror is a snapshot,
+not a live agent. Passing an explicit `--claude-dir`/`--codex-dir`/
+`--devin-transcripts`/`--devin-db` suppresses host data for that source, so
+the flag keeps meaning "exactly this". Re-run `sync` to refresh; the mirror
+is verbatim (`--delete`), so files the host removed stop counting.
 
 `speedtest` fires live inference calls and reports TTFT, decode tok/s, and
 token usage per run. `--model` and `--effort` are both required and resolved

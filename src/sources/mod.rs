@@ -29,7 +29,7 @@ pub enum AnyScanner {
     Devin(Box<devin::Scanner>),
     Claude {
         sc: claude::Scanner,
-        dir: PathBuf,
+        dirs: Vec<PathBuf>,
     },
     Codex {
         sc: codex::Scanner,
@@ -38,14 +38,14 @@ pub enum AnyScanner {
 }
 
 impl AnyScanner {
-    pub fn devin(dir: &std::path::Path, db_path: Option<&std::path::Path>) -> Result<Self> {
-        Ok(Self::Devin(Box::new(devin::Scanner::open(dir, db_path)?)))
+    pub fn devin(dirs: &[PathBuf], db_paths: &[PathBuf]) -> Result<Self> {
+        Ok(Self::Devin(Box::new(devin::Scanner::open(dirs, db_paths)?)))
     }
 
-    pub fn claude(dir: PathBuf) -> Self {
+    pub fn claude(dirs: Vec<PathBuf>) -> Self {
         Self::Claude {
-            sc: claude::Scanner::open(vec![dir.clone()]),
-            dir,
+            sc: claude::Scanner::open(dirs.clone()),
+            dirs,
         }
     }
 
@@ -70,7 +70,7 @@ impl AnyScanner {
     pub fn tick(&mut self, mp: &MultiProgress) -> Result<Vec<Call>> {
         match self {
             Self::Devin(sc) => sc.tick(mp),
-            Self::Claude { sc, dir } => Ok(sc.tick(&claude::walk(dir), mp).calls),
+            Self::Claude { sc, dirs } => Ok(sc.tick(&claude::walk(dirs), mp).calls),
             Self::Codex { sc, dirs } => Ok(sc.tick(&codex::walk(dirs), mp).calls),
         }
     }

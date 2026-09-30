@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `llmstat sync <host>`: mirror another machine's usage data over ssh into
+  `~/.local/share/llmstat/hosts/<host>/` (claude projects, codex sessions,
+  devin transcripts + a `sqlite3 .backup` snapshot of sessions.db); all
+  reports and `monitor` count every mirrored host automatically,
+  deduplicated against local data
+
+### Changed
+
+- the devin/claude/codex sources accept multiple roots internally — one
+  scanner covers the local dirs plus every host mirror, sharing dedup state
+
 ## [0.2.3](https://github.com/lexoliu/llmstat/compare/v0.2.2...v0.2.3) - 2026-09-13
 
 ### Added

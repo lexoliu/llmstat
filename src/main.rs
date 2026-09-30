@@ -7,6 +7,7 @@ mod render;
 mod report;
 mod sources;
 mod speedtest;
+mod sync;
 mod watch;
 
 use std::collections::HashSet;
@@ -42,11 +43,13 @@ struct Args {
     )]
     sources: Vec<String>,
 
-    /// Devin transcript directory.
+    /// Devin transcript directory. Suppresses synced host-mirror data for
+    /// the devin source.
     #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
     devin_transcripts: Option<PathBuf>,
 
     /// Devin sessions.db path (recovers calls missing from transcripts).
+    /// Suppresses synced host-mirror data for the devin source.
     #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath, global = true)]
     devin_db: Option<PathBuf>,
 
@@ -54,12 +57,14 @@ struct Args {
     #[arg(long, global = true)]
     devin_transcripts_only: bool,
 
-    /// Claude projects directory (~/.claude/projects).
+    /// Claude projects directory (~/.claude/projects). Suppresses synced
+    /// host-mirror data for the claude source.
     #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
     claude_dir: Option<PathBuf>,
 
     /// Codex root directory (~/.codex) containing sessions/ and
-    /// archived_sessions/.
+    /// archived_sessions/. Suppresses synced host-mirror data for the
+    /// codex source.
     #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
     codex_dir: Option<PathBuf>,
 
@@ -150,6 +155,13 @@ enum Cmd {
         #[arg(long)]
         list: bool,
     },
+    /// Pull another machine's usage data over ssh into
+    /// `~/.local/share/llmstat/hosts/<host>/` — reports and live modes
+    /// count every mirrored host automatically.
+    Sync {
+        /// ssh host (any alias/config entry `ssh` accepts).
+        host: String,
+    },
     /// Print a static shell completion script on stdout. For dynamic
     /// completion (knows --filter fields and values) use
     /// `source <(COMPLETE=zsh llmstat)` instead.
@@ -165,11 +177,23 @@ struct Sources {
     wanted: HashSet<String>,
     /// `--sources` was passed explicitly (missing dirs warn, not skip).
     explicit: bool,
-    devin_dir: PathBuf,
-    /// sessions.db path, None under `--devin-transcripts-only`.
-    devin_db: Option<PathBuf>,
-    claude_dir: PathBuf,
+    /// Devin transcript dirs — the local dir first, then each synced
+    /// host's `devin/transcripts/`.
+    devin_dirs: Vec<PathBuf>,
+    /// Every sessions.db to recover from (empty under
+    /// `--devin-transcripts-only`); the local db first.
+    devin_dbs: Vec<PathBuf>,
+    /// Claude projects dirs — local first, then host `claude/` mirrors.
+    claude_dirs: Vec<PathBuf>,
+    /// Local codex root (`~/.codex` or `--codex-dir`) — `watch` tails only
+    /// the local tree.
+    codex_root: PathBuf,
+    /// Codex session dirs — the local pair first, then host `codex/`
+    /// mirrors' session dirs.
     codex_dirs: Vec<PathBuf>,
+    /// Hosts whose mirrors contributed at least one path, for the coverage
+    /// line. Each maps to the sources it feeds.
+    hosts: Vec<(String, Vec<&'static str>)>,
 }
 
 fn resolve_sources(args: &Args) -> anyhow::Result<Sources> {
@@ -187,35 +211,85 @@ fn resolve_sources(args: &Args) -> anyhow::Result<Sources> {
             .map(|s| s.to_string())
             .collect()
     };
-    let devin_dir = args
-        .devin_transcripts
-        .clone()
-        .unwrap_or_else(sources::devin::default_transcripts_dir);
-    let devin_db = if args.devin_transcripts_only {
-        None
+    let mut devin_dirs = vec![
+        args.devin_transcripts
+            .clone()
+            .unwrap_or_else(sources::devin::default_transcripts_dir),
+    ];
+    let mut devin_dbs = if args.devin_transcripts_only {
+        Vec::new()
     } else {
-        Some(
+        vec![
             args.devin_db
                 .clone()
                 .unwrap_or_else(sources::devin::default_db_path),
-        )
+        ]
     };
-    let claude_dir = args
-        .claude_dir
-        .clone()
-        .unwrap_or_else(sources::claude::default_dir);
+    let mut claude_dirs = vec![
+        args.claude_dir
+            .clone()
+            .unwrap_or_else(sources::claude::default_dir),
+    ];
     let codex_root = args.codex_dir.clone().unwrap_or_else(|| {
         std::env::home_dir()
             .unwrap_or_else(|| PathBuf::from("~"))
             .join(".codex")
     });
+    let mut codex_dirs = sources::codex::dirs_for(&codex_root);
+
+    // Synced host mirrors feed the same sources. An explicit --*-dir /
+    // --devin-db flag relocates that source's local data — it suppresses
+    // host data for that source so the flag keeps meaning "exactly this".
+    // `--devin-transcripts-only` suppresses only the databases.
+    let devin_override = args.devin_transcripts.is_some() || args.devin_db.is_some();
+    let mut hosts = Vec::new();
+    for (name, root) in sync::host_mirrors() {
+        let mut fed = Vec::new();
+        if !devin_override {
+            let mut any = false;
+            let td = root.join("devin/transcripts");
+            if td.is_dir() {
+                devin_dirs.push(td);
+                any = true;
+            }
+            if !args.devin_transcripts_only {
+                let db = root.join("devin/sessions.db");
+                if db.exists() {
+                    devin_dbs.push(db);
+                    any = true;
+                }
+            }
+            if any {
+                fed.push("devin");
+            }
+        }
+        if args.claude_dir.is_none() {
+            let c = root.join("claude");
+            if c.is_dir() {
+                claude_dirs.push(c);
+                fed.push("claude");
+            }
+        }
+        if args.codex_dir.is_none() {
+            let cx = root.join("codex");
+            if cx.is_dir() {
+                codex_dirs.extend(sources::codex::dirs_for(&cx));
+                fed.push("codex");
+            }
+        }
+        if !fed.is_empty() {
+            hosts.push((name, fed));
+        }
+    }
     Ok(Sources {
         wanted,
         explicit,
-        devin_dir,
-        devin_db,
-        claude_dir,
-        codex_dirs: sources::codex::dirs_for(&codex_root),
+        devin_dirs,
+        devin_dbs,
+        claude_dirs,
+        codex_root,
+        codex_dirs,
+        hosts,
     })
 }
 
@@ -259,15 +333,22 @@ fn run_monitor(
         rules.extend(pricing::load_rules(p)?);
     }
 
+    let devin_dbs: Vec<PathBuf> = src
+        .devin_dbs
+        .iter()
+        .filter(|p| p.exists())
+        .cloned()
+        .collect();
     let mut scanners: Vec<sources::AnyScanner> = Vec::new();
-    if src.wanted.contains("devin") && (src.devin_dir.exists() || src.explicit) {
-        scanners.push(sources::AnyScanner::devin(
-            &src.devin_dir,
-            src.devin_db.as_deref().filter(|p| p.exists()),
-        )?);
+    if src.wanted.contains("devin")
+        && (src.devin_dirs.iter().any(|d| d.exists()) || !devin_dbs.is_empty() || src.explicit)
+    {
+        scanners.push(sources::AnyScanner::devin(&src.devin_dirs, &devin_dbs)?);
     }
-    if src.wanted.contains("claude") && (src.claude_dir.exists() || src.explicit) {
-        scanners.push(sources::AnyScanner::claude(src.claude_dir.clone()));
+    if src.wanted.contains("claude")
+        && (src.claude_dirs.iter().any(|d| d.exists()) || src.explicit)
+    {
+        scanners.push(sources::AnyScanner::claude(src.claude_dirs.clone()));
     }
     if src.wanted.contains("codex") && (src.codex_dirs.iter().any(|d| d.exists()) || src.explicit) {
         scanners.push(sources::AnyScanner::codex(src.codex_dirs.clone()));
@@ -317,8 +398,10 @@ fn run_monitor(
 fn run_watch(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
     let src = resolve_sources(args)?;
     let mut feeds: Vec<Box<dyn watch::Source>> = Vec::new();
+    // watch tails live agents — only the local data applies (host mirrors
+    // are stale snapshots).
     if src.wanted.contains("devin") {
-        match &src.devin_db {
+        match src.devin_dbs.first() {
             Some(db) if db.exists() => feeds.push(Box::new(watch::Devin::open(db)?)),
             _ if src.explicit => anyhow::bail!("devin: watch needs sessions.db"),
             _ => {}
@@ -326,25 +409,20 @@ fn run_watch(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
     }
     if src.wanted.contains("claude") {
         // the pid registry sits next to the projects dir
-        let sessions = src
-            .claude_dir
+        let claude_dir = &src.claude_dirs[0];
+        let sessions = claude_dir
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("sessions");
         if sessions.exists() || src.explicit {
-            feeds.push(Box::new(watch::Claude::new(
-                sessions,
-                src.claude_dir.clone(),
-            )));
+            feeds.push(Box::new(watch::Claude::new(sessions, claude_dir.clone())));
         }
     }
-    if src.wanted.contains("codex") && (src.codex_dirs.iter().any(|d| d.exists()) || src.explicit) {
-        let root = src
-            .codex_dirs
-            .first()
-            .and_then(|d| d.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_default();
-        feeds.push(Box::new(watch::Codex::new(src.codex_dirs.clone(), &root)));
+    let local_codex = sources::codex::dirs_for(&src.codex_root);
+    if src.wanted.contains("codex")
+        && (local_codex.iter().any(|d| d.exists()) || src.explicit)
+    {
+        feeds.push(Box::new(watch::Codex::new(local_codex, &src.codex_root)));
     }
     if feeds.is_empty() {
         anyhow::bail!("no live-agent sources found");
@@ -394,6 +472,9 @@ fn main() -> anyhow::Result<()> {
         } => {
             return speedtest::run(provider, model, effort, prompt, runs, max_tokens, list);
         }
+        Cmd::Sync { ref host } => {
+            return sync::run(host);
+        }
         Cmd::Completions { shell } => {
             let mut cmd = Args::command();
             let name = cmd.get_name().to_string();
@@ -439,24 +520,30 @@ fn main() -> anyhow::Result<()> {
         Box<dyn FnOnce() -> anyhow::Result<SourceOut> + Send + 'a>,
     );
     let jobs: Vec<Job<'_>> = {
-        let devin_dir = src.devin_dir.clone();
-        let devin_db = src.devin_db.clone();
-        let claude_dir = src.claude_dir.clone();
+        let devin_dirs = src.devin_dirs.clone();
+        let devin_dbs: Vec<PathBuf> = src
+            .devin_dbs
+            .iter()
+            .filter(|p| p.exists())
+            .cloned()
+            .collect();
+        let claude_dirs = src.claude_dirs.clone();
         let codex_dirs = src.codex_dirs.clone();
         let codex_present = codex_dirs.iter().any(|d| d.exists());
+        let devin_present =
+            devin_dirs.iter().any(|d| d.exists()) || !devin_dbs.is_empty();
+        let claude_present = claude_dirs.iter().any(|d| d.exists());
         let mp = &mp;
         vec![
             (
                 "devin",
-                devin_dir.exists(),
-                Box::new(move || {
-                    sources::devin::load(&devin_dir, devin_db.as_deref().filter(|p| p.exists()), mp)
-                }) as _,
+                devin_present,
+                Box::new(move || sources::devin::load(&devin_dirs, &devin_dbs, mp)) as _,
             ),
             (
                 "claude",
-                claude_dir.exists(),
-                Box::new(move || sources::claude::load(&claude_dir, mp)) as _,
+                claude_present,
+                Box::new(move || sources::claude::load(&claude_dirs, mp)) as _,
             ),
             (
                 "codex",
@@ -497,6 +584,9 @@ fn main() -> anyhow::Result<()> {
         let litellm = litellm_h.join().expect("litellm price load panicked");
         let book = PriceBook::new(rules, litellm);
 
+        for (host, fed) in &src.hosts {
+            coverage.push(format!("host {host}: {}", fed.join(", ")));
+        }
         coverage.push(format!("prices: {}", book.source_note));
         if let Some(f) = &filter {
             for e in f.raw() {

@@ -13,14 +13,14 @@
 pub mod cache;
 pub mod db;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use indicatif::MultiProgress;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::fmt;
@@ -64,10 +64,13 @@ pub fn default_db_path() -> PathBuf {
 
 /// Devin source with resident state: transcripts are read on the first
 /// `tick` (they seed the dedup multiset and split ratios); every tick tails
-/// sessions.db for calls not covered by any transcript step.
+/// each sessions.db for calls not covered by any transcript step. `dirs`
+/// holds every transcript directory (local + synced host mirrors) and `dbs`
+/// every sessions.db — session ids are globally unique, so the dedup and
+/// ratio maps are shared across them all.
 pub struct Scanner {
-    dir: PathBuf,
-    db: Option<db::Scanner>,
+    dirs: Vec<PathBuf>,
+    dbs: Vec<db::Scanner>,
     first: bool,
     /// session -> multiset of transcript prompt sizes, for exact dedup
     /// against db calls.
@@ -82,26 +85,26 @@ pub struct Scanner {
     files_failed: usize,
     recovered_calls: usize,
     recovered_tokens: u64,
-    db_failed: bool,
+    dbs_failed: usize,
 }
 
 impl Scanner {
-    /// `db_path` None = transcripts-only mode. A db that fails to open
+    /// An empty `db_paths` = transcripts-only mode. A db that fails to open
     /// degrades to transcripts-only with a warning, same as one-shot.
-    pub fn open(dir: &Path, db_path: Option<&Path>) -> Result<Self> {
-        let db = match db_path {
-            Some(p) => match db::Scanner::open(p) {
+    pub fn open(dirs: &[PathBuf], db_paths: &[PathBuf]) -> Result<Self> {
+        let dbs = db_paths
+            .iter()
+            .filter_map(|p| match db::Scanner::open(p) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    tracing::warn!("sessions.db unreadable: {e:#}");
+                    tracing::warn!("{} unreadable: {e:#}", p.display());
                     None
                 }
-            },
-            None => None,
-        };
+            })
+            .collect();
         Ok(Self {
-            dir: dir.to_path_buf(),
-            db,
+            dirs: dirs.to_vec(),
+            dbs,
             first: true,
             prompt_ms: BTreeMap::new(),
             ratios: HashMap::new(),
@@ -111,18 +114,29 @@ impl Scanner {
             files_failed: 0,
             recovered_calls: 0,
             recovered_tokens: 0,
-            db_failed: false,
+            dbs_failed: 0,
         })
     }
 
     /// Read every transcript, emit its calls, and fill the dedup/ratio
     /// maps used to project db-recovered calls. Runs on the first tick.
     fn scan_transcripts(&mut self) -> Result<Vec<Call>> {
-        let mut files: Vec<PathBuf> = fs::read_dir(&self.dir)
-            .with_context(|| format!("cannot read transcript dir {}", self.dir.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .collect();
+        let mut files = Vec::new();
+        for dir in &self.dirs {
+            match fs::read_dir(dir) {
+                Ok(rd) => files.extend(
+                    rd.filter_map(|e| e.ok().map(|e| e.path()))
+                        .filter(|p| p.extension().is_some_and(|x| x == "json")),
+                ),
+                // Missing dirs contribute nothing — a host may carry only a
+                // sessions.db. Genuinely unreadable ones warn instead of
+                // failing the run.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!("cannot read transcript dir {}: {e:#}", dir.display())
+                }
+            }
+        }
         files.sort();
 
         let mut calls = Vec::new();
@@ -148,9 +162,9 @@ impl Scanner {
                 .to_string_lossy()
                 .to_string();
             let title: Option<Arc<str>> = self
-                .db
-                .as_ref()
-                .and_then(|d| d.session_meta.get(&name))
+                .dbs
+                .iter()
+                .find_map(|d| d.session_meta.get(&name))
                 .and_then(|(_, t)| t.as_deref())
                 .map(Arc::from);
 
@@ -204,7 +218,9 @@ impl Scanner {
 
     /// Turn a recovered db call into a `Call` — None when it matches an
     /// already-counted transcript step (exact prompt-token match).
-    fn project(&mut self, call: db::DbCall) -> Option<Call> {
+    /// `db_idx` identifies which sessions.db produced the call, for its
+    /// session-meta table.
+    fn project(&mut self, call: db::DbCall, db_idx: usize) -> Option<Call> {
         if call.prompt == 0 {
             return None;
         }
@@ -231,8 +247,8 @@ impl Scanner {
         let cached = ((call.prompt as f64 * cr).round() as u64).min(call.prompt);
         let output = (call.prompt as f64 * or_).round() as u64;
         let meta = self
-            .db
-            .as_ref()
+            .dbs
+            .get(db_idx)
             .and_then(|d| d.session_meta.get(&call.session));
         let model = meta
             .map(|(m, _)| m)
@@ -258,24 +274,24 @@ impl Scanner {
         })
     }
 
-    /// First tick: transcripts + whatever db tail the cache missed. Later
-    /// ticks: just the db tail — transcripts aren't re-read (their calls
-    /// would double-count; db covers new calls anyway, as estimates).
+    /// First tick: transcripts + whatever db tails the caches missed. Later
+    /// ticks: just the db tails — transcripts aren't re-read (their calls
+    /// would double-count; dbs cover new calls anyway, as estimates).
     pub fn tick(&mut self, mp: &MultiProgress) -> Result<Vec<Call>> {
         let mut calls = Vec::new();
         if self.first {
             self.first = false;
             calls.extend(self.scan_transcripts()?);
         }
-        if let Some(d) = &mut self.db {
-            match d.tick(mp) {
+        for i in 0..self.dbs.len() {
+            match self.dbs[i].tick(mp) {
                 Ok(rows) => {
                     for c in rows {
-                        calls.extend(self.project(c));
+                        calls.extend(self.project(c, i));
                     }
                 }
                 Err(e) => {
-                    self.db_failed = true;
+                    self.dbs_failed += 1;
                     tracing::warn!("sessions.db scan failed: {e:#}");
                 }
             }
@@ -285,18 +301,23 @@ impl Scanner {
 
     /// Coverage line for the report header.
     pub fn note(&self) -> String {
-        let mut note = match self.db.is_some() && !self.db_failed {
-            true => format!(
-                "devin: {} transcripts · +{} calls ({} tok) recovered from sessions.db",
-                self.files_read,
-                self.recovered_calls,
-                fmt::tokens(self.recovered_tokens)
-            ),
-            false => format!(
+        let dbs_ok = self.dbs.len() - self.dbs_failed;
+        let mut note = match dbs_ok {
+            0 => format!(
                 "devin: {} transcripts (sessions.db skipped)",
                 self.files_read
             ),
+            _ => format!(
+                "devin: {} transcripts · +{} calls ({} tok) recovered from {} sessions.db",
+                self.files_read,
+                self.recovered_calls,
+                fmt::tokens(self.recovered_tokens),
+                dbs_ok
+            ),
         };
+        if self.dbs_failed > 0 {
+            note.push_str(&format!(" · {} sessions.db failed", self.dbs_failed));
+        }
         if self.files_failed > 0 {
             note.push_str(&format!(" · {} files failed", self.files_failed));
         }
@@ -304,10 +325,10 @@ impl Scanner {
     }
 }
 
-/// Scan `dir` for transcript JSONs, then recover extra calls from `db_path`
-/// (sessions.db) unless it is None.
-pub fn load(dir: &Path, db_path: Option<&Path>, mp: &MultiProgress) -> Result<SourceOut> {
-    let mut sc = Scanner::open(dir, db_path)?;
+/// Scan `dirs` for transcript JSONs, then recover extra calls from every
+/// sessions.db in `db_paths`.
+pub fn load(dirs: &[PathBuf], db_paths: &[PathBuf], mp: &MultiProgress) -> Result<SourceOut> {
+    let mut sc = Scanner::open(dirs, db_paths)?;
     let calls = sc.tick(mp)?;
     let note = sc.note();
     Ok(SourceOut { calls, note })
