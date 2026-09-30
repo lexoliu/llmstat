@@ -62,6 +62,29 @@ pub fn energy(kwh: f64) -> String {
     }
 }
 
+/// Human-readable size: 749MB / 2.3GB / 512B.
+pub fn bytes(n: u64) -> String {
+    const UNITS: [(f64, &str); 4] = [
+        (1e12, "TB"),
+        (1e9, "GB"),
+        (1e6, "MB"),
+        (1e3, "KB"),
+    ];
+    for (u, s) in UNITS {
+        let v = n as f64 / u;
+        if v >= 1.0 {
+            return if v >= 100.0 {
+                format!("{v:.0}{s}")
+            } else if v >= 10.0 {
+                format!("{v:.1}{s}")
+            } else {
+                format!("{v:.2}{s}")
+            };
+        }
+    }
+    format!("{n}B")
+}
+
 /// "Sep 12 14:03" local time.
 pub fn datetime(ts: chrono::DateTime<chrono::Utc>) -> String {
     ts.with_timezone(&chrono::Local)
