@@ -239,7 +239,9 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
         .or_else(|| std::env::var("COLUMNS").ok()?.parse().ok())
         .unwrap_or(120);
     // full = show in/cached/out columns; dist bar uses whatever width is left
-    let src_w = if multi_src { 8 } else { 0 };
+    // "antigravity" is the longest source id.
+    const SRC_W: usize = 12;
+    let src_w = if multi_src { SRC_W + 2 } else { 0 };
     let base_w = 2 + src_w + lw + 8 + 7 + pw + 22; // without in/cached/out or dist
     let full = base_w + 27 + 16 <= tw;
     let dist_w = if full {
@@ -252,7 +254,7 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
     {
         let mut h = String::new();
         if multi_src {
-            h.push_str(&format!(" {:<6}", p.bold("SRC")));
+            h.push_str(&format!(" {:<SRC_W$}", p.bold("SRC"), SRC_W = SRC_W));
         }
         h.push_str(&format!(
             " {:<lw$} {:>7} {:>6}",
@@ -295,7 +297,7 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
         if multi_src {
             row.push_str(&format!(
                 " {}",
-                pad_st(p, m.source, 6, false, |p, s| p.dim(s))
+                pad_st(p, m.source, SRC_W, false, |p, s| p.dim(s))
             ));
         }
         row.push_str(&format!(

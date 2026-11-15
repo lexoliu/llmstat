@@ -440,8 +440,10 @@ impl Provider for Antigravity {
         Ok(RunStats {
             ttft: ttft.context("stream ended without any content")?,
             total: t0.elapsed(),
-            // parity with devin: hidden thinking tokens count as generated
-            output_tokens: output + thoughts,
+            // Thinking never streams — all thoughtsTokenCount was generated
+            // before the first byte, so it counts toward TTFT, not decode.
+            output_tokens: output,
+            thinking_tokens: Some(thoughts),
             input_tokens: input,
             cache_read_tokens: 0,
             stop,

@@ -1,9 +1,11 @@
 //! Per-CLI data sources. Each produces `Call`s plus a coverage note.
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod devin;
 pub mod filecache;
+pub mod grok;
 
 use anyhow::Result;
 use indicatif::MultiProgress;
@@ -29,23 +31,28 @@ pub enum AnyScanner {
     Devin(Box<devin::Scanner>),
     Claude {
         sc: claude::Scanner,
-        dir: PathBuf,
+        dirs: Vec<PathBuf>,
     },
     Codex {
         sc: codex::Scanner,
         dirs: Vec<PathBuf>,
     },
+    Grok {
+        sc: grok::Scanner,
+        dirs: Vec<PathBuf>,
+    },
+    Antigravity(Box<antigravity::Scanner>),
 }
 
 impl AnyScanner {
-    pub fn devin(dir: &std::path::Path, db_path: Option<&std::path::Path>) -> Result<Self> {
-        Ok(Self::Devin(Box::new(devin::Scanner::open(dir, db_path)?)))
+    pub fn devin(dirs: &[PathBuf], db_paths: &[PathBuf]) -> Result<Self> {
+        Ok(Self::Devin(Box::new(devin::Scanner::open(dirs, db_paths)?)))
     }
 
-    pub fn claude(dir: PathBuf) -> Self {
+    pub fn claude(dirs: Vec<PathBuf>) -> Self {
         Self::Claude {
-            sc: claude::Scanner::open(vec![dir.clone()]),
-            dir,
+            sc: claude::Scanner::open(dirs.clone()),
+            dirs,
         }
     }
 
@@ -56,12 +63,27 @@ impl AnyScanner {
         }
     }
 
+    pub fn grok(dirs: Vec<PathBuf>) -> Self {
+        Self::Grok {
+            sc: grok::Scanner::open(dirs.clone()),
+            dirs,
+        }
+    }
+
+    pub fn antigravity(dirs: Vec<PathBuf>) -> Result<Self> {
+        Ok(Self::Antigravity(Box::new(antigravity::Scanner::open(
+            &dirs,
+        )?)))
+    }
+
     /// Which source this scanner emits.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Devin(_) => "devin",
             Self::Claude { .. } => "claude",
             Self::Codex { .. } => "codex",
+            Self::Grok { .. } => "grok",
+            Self::Antigravity(_) => "antigravity",
         }
     }
 
@@ -70,8 +92,10 @@ impl AnyScanner {
     pub fn tick(&mut self, mp: &MultiProgress) -> Result<Vec<Call>> {
         match self {
             Self::Devin(sc) => sc.tick(mp),
-            Self::Claude { sc, dir } => Ok(sc.tick(&claude::walk(dir), mp).calls),
+            Self::Claude { sc, dirs } => Ok(sc.tick(&claude::walk(dirs), mp).calls),
             Self::Codex { sc, dirs } => Ok(sc.tick(&codex::walk(dirs), mp).calls),
+            Self::Grok { sc, dirs } => Ok(sc.tick(&grok::walk(dirs), mp).calls),
+            Self::Antigravity(sc) => sc.tick(mp),
         }
     }
 
@@ -82,6 +106,8 @@ impl AnyScanner {
             Self::Devin(_) => {}
             Self::Claude { sc, .. } => sc.save(),
             Self::Codex { sc, .. } => sc.save(),
+            Self::Grok { sc, .. } => sc.save(),
+            Self::Antigravity(sc) => sc.save(),
         }
     }
 }

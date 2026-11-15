@@ -69,7 +69,9 @@ fn prefetch(path: &Path, offset: u64) -> Arc<AtomicBool> {
     stop
 }
 
-fn open(path: &Path) -> Result<Connection> {
+/// Open sessions.db read-only with the big-file pragmas (mmap + page
+/// cache). Shared by the token scanner and `watch`'s live tail.
+pub(crate) fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("cannot open {}", path.display()))?;
     // Memory-map the multi-GB file: turns the scan into page-cache hits

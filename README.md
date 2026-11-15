@@ -4,8 +4,9 @@
 [![release](https://img.shields.io/github/v/release/lexoliu/llmstat)](https://github.com/lexoliu/llmstat/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-Token usage and cost reports for local LLM CLIs: Devin CLI, Claude Code, and
-Codex CLI. Prices come from the LiteLLM pricebook. Pure Rust.
+Token usage and cost reports for local LLM CLIs: Devin CLI, Claude Code,
+Codex CLI, Grok Build, and Antigravity. Prices come from the LiteLLM
+pricebook. Pure Rust.
 
 <img src="assets/monitor.png" width="860" alt="llmstat monitor — rolling tokens/s chart over a per-session table">
 
@@ -14,6 +15,10 @@ Codex CLI. Prices come from the LiteLLM pricebook. Pure Rust.
   the list price is struck through and the actual $0.00 is shown in green
 - `monitor` is a live TUI: rolling tokens/s chart plus a per-session table;
   click a column header to sort, click a session name to reveal its id
+- `watch` tails every running agent's output in a tiled grid — read-only,
+  one pane per session across Devin, Claude Code, Codex, Grok, and Antigravity
+- `serve` emits the same live stats headlessly — a JSON snapshot written
+  every tick for widgets, scripts, and other external consumers
 - Each report estimates the energy behind the tokens (kWh and cost at the
   US industrial electricity rate)
 - All sources are cached incrementally; repeat runs only parse appended data
@@ -49,6 +54,32 @@ From source via crates.io:
 cargo install llmstat
 ```
 
+## Shell completions
+
+Dynamic completion — recommended; knows `--filter` fields and values
+(`source:` → devin/claude/codex/grok/antigravity, `date>` → today/yesterday/…,
+`model~` → your pricing labels) plus `speedtest --effort` tiers:
+
+```sh
+# zsh — add to ~/.zshrc
+source <(COMPLETE=zsh llmstat)
+
+# bash — add to ~/.bashrc
+source <(COMPLETE=bash llmstat)
+
+# fish — add to ~/.config/fish/config.fish
+COMPLETE=fish llmstat | source
+```
+
+Or generate a static script (subcommands, flags, `--sources` values, file
+hints — but no `--filter` expression smarts):
+
+```sh
+llmstat completions zsh > ~/.zfunc/_llmstat   # any dir in $fpath
+```
+
+`completions <shell>` supports bash, elvish, fish, powershell, and zsh.
+
 ## Usage
 
 ```
@@ -57,6 +88,9 @@ llmstat daily           # last 24 hours, hourly timeline  (alias: 24h)
 llmstat weekly          # last 7 days, daily timeline
 llmstat monthly         # last 30 days, daily timeline
 llmstat monitor         # real-time monitor: rolling tok/s chart + per-session table
+llmstat watch           # tiled live tails of every running agent (read-only)
+llmstat serve           # headless: write live stats as JSON each tick
+llmstat sync my-other-mac  # mirror another machine's usage data over ssh
 llmstat speedtest devin --model swe-2 --effort max --runs 3
 llmstat speedtest antigravity --model gemini-3.8-flash --effort low
 llmstat speedtest devin --list   # live model catalog
@@ -70,6 +104,39 @@ Clicking a column header sorts the table — default is rate descending, then
 last activity. Tokens appear when an API call completes, which is when the
 CLIs write usage to disk. Quit with `q`, `Esc`, or `Ctrl-C`.
 
+`watch` shows the output of every agent currently running — one tile per
+session, updating live (default 500ms, `--interval-ms` floor 200ms). It is
+strictly read-only: nothing is ever sent back to the agents. Liveness comes
+from the real signal each CLI exposes — held `flock`s for Devin, Grok, and
+Antigravity, the pid registry for Claude Code, fresh rollout files for Codex.
+Panes of finished
+sessions linger briefly, then drop. The grid tops out at 24 tiles; beyond
+that the newest sessions wait for a slot so panes never reshuffle. Click a
+tile to zoom, scroll inside it with the wheel or
+`↑`/`↓`/`PgUp`/`PgDn`, cycle focus with `Tab`, set the column count with
+`-`/`+` (`0` = auto). Quit with `q`, `Esc`, or `Ctrl-C`.
+
+`serve` runs `monitor`'s resident scanners without the TUI: every tick it
+atomically rewrites a JSON snapshot (default `~/.cache/llmstat/live.json`,
+override with `--out`) carrying current tok/s over 5s/30s windows, a
+per-source breakdown, and the freshest Claude usage-limit hit it observed
+while tailing transcripts. External consumers read the file instead of
+scraping a terminal. `--interval-ms` works the same as `monitor`.
+
+`sync <host>` pulls another machine's usage data over ssh into a mirror at
+`~/.local/share/llmstat/hosts/<host>/` — the remote's `~/.claude/projects`,
+`~/.codex/{sessions,archived_sessions}`, Devin `transcripts/`, a
+consistent `sqlite3 .backup` snapshot of `sessions.db`, Grok
+`updates.jsonl`/`summary.json`, and Antigravity conversation dbs. Reports and
+`monitor` count every mirrored host automatically; the per-source
+dedup keys make overlap with local files (resumed sessions, hand-copied
+transcripts) count once. `watch` stays local-only — a mirror is a snapshot,
+not a live agent. Passing an explicit `--claude-dir`/`--codex-dir`/
+`--devin-transcripts`/`--devin-db`/`--grok-dir`/`--antigravity-dir`
+suppresses host data for that source, so the flag keeps meaning "exactly
+this". Re-run `sync` to refresh; the mirror is verbatim (`--delete`), so
+files the host removed stop counting.
+
 `speedtest` fires live inference calls and reports TTFT, decode tok/s, and
 token usage per run. `--model` and `--effort` are both required and resolved
 against the provider's live catalog (`<model>-<effort>` → uid), so an
@@ -80,17 +147,52 @@ credentials).
 
 ```
 llmstat --sources devin,claude      # read only these sources
+llmstat -f 'source:claude and not free'   # keep only matching calls
+llmstat weekly -f 'model~opus'      # works on reports and `monitor`
 llmstat --devin-transcripts DIR     # override ~/.local/share/devin/cli/transcripts
 llmstat --devin-db FILE             # override the sessions.db path
 llmstat --devin-transcripts-only    # skip sessions.db (transcripts only)
 llmstat --claude-dir DIR            # override ~/.claude/projects
 llmstat --codex-dir DIR             # override ~/.codex
+llmstat --grok-dir DIR              # override ~/.grok/sessions
+llmstat --antigravity-dir DIR       # override ~/.gemini/antigravity-cli
 llmstat --pricing rules.toml        # extra pricing rules (see below)
 llmstat --refresh-prices            # re-fetch the LiteLLM pricebook
 ```
 
 Without `--sources`, every source whose data directory exists is read; the
-three scans run concurrently.
+scans run concurrently.
+
+## Filters
+
+`--filter`/`-f` keeps only matching calls — reports, timeline, costs, and
+energy all reflect the subset. Repeatable; multiple filters are ANDed. A
+bare word means `model~word`.
+
+```sh
+llmstat -f 'opus'                          # model contains "opus"
+llmstat -f 'source:claude and model~opus'
+llmstat -f 'not free'                      # only paid models
+llmstat -f 'tokens>100k or cost>0.5'
+llmstat weekly -f 'date>=2026-09-01' -f 'family:swe-2'
+```
+
+| field | matches | ops |
+|---|---|---|
+| `model` | raw model name | `=` `!=` `~` `:` `!~` `!:` |
+| `family` | resolved pricing label | same |
+| `source` | `devin`/`claude`/`codex`/`grok`/`antigravity` | same |
+| `session` | session id or title | same |
+| `tokens` `input` `cached` `output` | per-call counts (`1k`/`2m`/`3b`) | `< <= = != >= >` |
+| `cost` | per-call list-price USD | same |
+| `date` | `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, RFC3339, `today`, `yesterday`, `12h`/`7d`/`2w` | same |
+| `estimated` `free` `paid` `unpriced` | flags | bare, or `= true/false` |
+
+`=`/`!=` are exact after normalization (lowercase, non-alnum → `-`), so
+`model=swe-2-max` matches `SWE-2 Max`; `~`/`:` are substring. Combine with
+`and`/`or`/`not` (also `&&`/`||`/`!`) and parens; adjacent predicates AND.
+Day-grained dates span the whole local day: `date=2026-09-11` matches that
+day, `date>2026-09-11` starts the day after.
 
 ## Sample output (daily)
 
@@ -131,6 +233,8 @@ Built-in rules price free-in-CLI models at an equivalent public model:
 | SWE-2 | `kimi-k3` ($3.00/$0.30/$15.00) | free in Devin → $0.00 |
 | Adaptive | `kimi-k3` (est.) | free in Devin → $0.00 |
 | GLM-5 | `glm-5` | free in Devin → $0.00 |
+| Grok 4.6 / 4.7 | `xai/grok-4.6`, `xai/grok-4.7` | paid |
+| Gemini 4 Argon | `gemini/gemini-4-argon` | paid |
 
 A rule may carry `as` = a LiteLLM key, so the equivalent model's *current*
 price is borrowed from the pricebook and the rule's own numbers only apply

@@ -227,20 +227,26 @@ impl Jsonl for Claude {
 /// ticks emit only newly appended calls.
 pub type Scanner = filecache::Scanner<Claude>;
 
-/// `*.jsonl` under `dir`, as (path, len).
-pub fn walk(dir: &Path) -> Vec<(PathBuf, u64)> {
-    walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|e| e.metadata().ok().map(|m| (e.into_path(), m.len())))
-        .collect()
+/// `*.jsonl` under each dir, as (path, len). Multiple project dirs are
+/// supported so synced host mirrors can be scanned alongside the local one.
+pub fn walk(dirs: &[PathBuf]) -> Vec<(PathBuf, u64)> {
+    let mut files = Vec::new();
+    for dir in dirs {
+        files.extend(
+            walkdir::WalkDir::new(dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+                .filter_map(|e| e.metadata().ok().map(|m| (e.into_path(), m.len()))),
+        );
+    }
+    files
 }
 
-pub fn load(dir: &Path, mp: &MultiProgress) -> Result<SourceOut> {
+pub fn load(dirs: &[PathBuf], mp: &MultiProgress) -> Result<SourceOut> {
     let t0 = std::time::Instant::now();
-    let mut sc = Scanner::open(vec![dir.to_path_buf()]);
-    let found = walk(dir);
+    let mut sc = Scanner::open(dirs.to_vec());
+    let found = walk(dirs);
     let t = sc.tick(&found, mp);
     sc.save();
     tracing::debug!(

@@ -82,7 +82,8 @@ pub fn dirs_for(root: &Path) -> Vec<PathBuf> {
     vec![root.join("sessions"), root.join("archived_sessions")]
 }
 
-fn session_id_of(path: &Path) -> String {
+/// `rollout-<ts>-<uuid>.jsonl` -> the uuid tail.
+pub(crate) fn session_id_of(path: &Path) -> String {
     // rollout-<ts>-<uuid>.jsonl -> the uuid tail
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     stem.rsplit('-')

@@ -30,6 +30,7 @@ use std::io::{IsTerminal, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::filter::{Filter, Verdict};
 use crate::fmt;
 use crate::pricing::{PriceBook, Pricing, Resolved};
 use crate::report::{Call, Usage};
@@ -142,6 +143,8 @@ pub struct State {
     session_cost: f64,
     /// Transient note in the footer (scanner errors, etc).
     status: String,
+    /// Active `--filter` text, shown in the footer when set.
+    filter_note: Option<String>,
 }
 
 impl State {
@@ -160,6 +163,7 @@ impl State {
             session_calls: 0,
             session_cost: 0.0,
             status: String::new(),
+            filter_note: None,
         }
     }
 
@@ -167,7 +171,11 @@ impl State {
         self.status = s;
     }
 
-    pub fn apply(&mut self, calls: Vec<Call>, book: &PriceBook) {
+    pub fn set_filter(&mut self, note: String) {
+        self.filter_note = Some(note);
+    }
+
+    pub fn apply(&mut self, calls: Vec<Call>, book: &PriceBook, filter: Option<&Filter>) {
         let now = Utc::now().timestamp();
         for c in calls {
             let ridx = *self.resolved.entry(c.model.clone()).or_insert_with(|| {
@@ -176,6 +184,11 @@ impl State {
             });
             let r = &self.resolved_list[ridx];
             let (pricing, price) = (r.pricing.clone(), r.price);
+            if let Some(f) = filter
+                && f.eval(&c, Some(r)) == Verdict::Fail
+            {
+                continue;
+            }
             let sec = c.ts.map(|t| t.timestamp()).unwrap_or(now).min(now);
             let tot = c.usage.total();
 
@@ -231,12 +244,17 @@ impl State {
 
     /// Tokens/s across all sources, averaged over `secs`.
     fn rate(&self, secs: i64) -> f64 {
+        self.source_rates(secs).into_iter().map(|(_, v)| v).sum()
+    }
+
+    /// Per-source tokens/s averaged over `secs` — the same rolling window
+    /// the chart draws.
+    pub fn source_rates(&self, secs: i64) -> Vec<(&'static str, f64)> {
         let now = Utc::now().timestamp();
         self.series
-            .values()
-            .map(|r| r.sum_since(now - secs) as f64)
-            .sum::<f64>()
-            / secs as f64
+            .iter()
+            .map(|(s, r)| (*s, r.sum_since(now - secs) as f64 / secs as f64))
+            .collect()
     }
 }
 
@@ -244,6 +262,9 @@ fn color_of(source: &str) -> Color {
     match source {
         "devin" => Color::Cyan,
         "claude" => Color::Yellow,
+        "codex" => Color::Magenta,
+        "grok" => Color::Blue,
+        "antigravity" => Color::Green,
         _ => Color::Magenta,
     }
 }
@@ -277,7 +298,7 @@ impl Dir {
 }
 
 const COLS: [(Col, &str, Constraint); 8] = [
-    (Col::Src, "SRC", Constraint::Length(7)),
+    (Col::Src, "SRC", Constraint::Length(13)),
     (Col::Session, "SESSION", Constraint::Min(20)),
     (Col::Model, "MODEL", Constraint::Length(18)),
     (Col::Tokens, "TOKENS", Constraint::Length(10)),
@@ -454,7 +475,9 @@ fn draw(
     // ── rolling rate chart ────────────────────────────────────────────
     let mut data = Vec::new();
     let mut ymax = 1.0f64;
-    for s in ["devin", "claude", "codex"] {
+    let mut names: Vec<&'static str> = st.series.keys().copied().collect();
+    names.sort();
+    for s in names {
         if let Some(r) = st.series.get(s) {
             let pts = r.series(now);
             ymax = pts.iter().map(|p| p.1).fold(ymax, f64::max);
@@ -623,6 +646,12 @@ fn draw(
             Style::default().fg(Color::DarkGray),
         ));
     }
+    if let Some(f) = &st.filter_note {
+        spans.push(Span::styled(
+            format!("  │  filter: {f}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     let status = if st.status.is_empty() {
         Line::default()
     } else {
@@ -649,6 +678,7 @@ pub fn run(
     scanners: &mut [AnyScanner],
     mut st: State,
     book: &PriceBook,
+    filter: Option<&Filter>,
     interval: Duration,
 ) -> Result<()> {
     if !std::io::stdout().is_terminal() {
@@ -744,7 +774,7 @@ pub fn run(
                     if !calls.is_empty() {
                         tracing::debug!(src = sc.name(), n = calls.len(), "tick emitted");
                     }
-                    st.apply(calls, book);
+                    st.apply(calls, book, filter);
                 }
                 Err(e) => st.status = format!("{}: {e:#}", sc.name()),
             }
