@@ -16,7 +16,9 @@ hosting = "github"
 # Publish GitHub build provenance attestations for release artifacts
 github-attestations = true
 # release.yml is hand-edited: it carries a publish-crate job (crates.io
-# OIDC publish) that dist can't generate. "ci" tells dist's plan check to
-# stop diffing the generated workflow against the committed one — future
-# `dist generate` runs must have their changes merged in manually.
+# OIDC publish) that dist can't generate, plus workflow_dispatch so
+# release-plz can start it after a GITHUB_TOKEN tag push. "ci" tells
+# dist's plan check to stop diffing the generated workflow against the
+# committed one — future `dist generate` runs must have their changes
+# merged in manually.
 allow-dirty = ["ci"]
