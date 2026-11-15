@@ -1,44 +1,86 @@
 name: release-plz
 
+# A push to main runs Test, then both release-plz jobs. `release-pr` opens
+# or refreshes the version bump PR against main; `release` tags when
+# Cargo.toml is unpublished. Tags are pushed with GITHUB_TOKEN, which does
+# not cascade into release.yml, so `release` dispatches it.
 on:
   push:
     branches: [main]
 
 jobs:
+  test:
+    name: Test
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
   # Pushes git tag v{version} when Cargo.toml's version is unpublished.
-  # The tag (pushed under the RELEASE_TOKEN PAT) cascades into the
-  # tag-triggered release.yml, which does the crates.io publish via OIDC
-  # trusted publishing plus the cargo-dist binary builds — one atomic run.
+  # GITHUB_TOKEN tag pushes do not trigger release.yml, so dispatch it;
+  # that workflow publishes to crates.io via OIDC and builds the cargo-dist
+  # binaries in one run.
   release:
     name: tag release
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
+    concurrency:
+      group: release-plz-release
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: MarcoIeni/release-plz-action@v0.5
+        id: release-plz
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Dispatch cargo-dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          echo "${RELEASES:-[]}" | jq -r '.[] | .tag // ("v" + .version)' |
+          while read -r tag; do
+            gh workflow run release.yml -f "tag=$tag"
+          done
 
   # Keeps a version-bump + changelog PR open against main.
   release-pr:
     name: release PR
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
+      # Approving the release PR's held CI runs.
+      actions: write
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: MarcoIeni/release-plz-action@v0.5
+        id: release-plz
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # GitHub holds the pull request runs of a pull request the Actions bot
+      # opened or pushed until they are approved.
+      - name: Approve the release PR's CI
+        if: steps.release-plz.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.release-plz.outputs.pr }}
+        run: bash .github/scripts/approve-held-runs.sh "$(jq -er .number <<<"$PR")"
