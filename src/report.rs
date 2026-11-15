@@ -40,12 +40,13 @@ impl Usage {
 /// One model call emitted by a source. Session/model are `Arc<str>` — the
 /// file cache interns them per file, so rehydration is a refcount bump.
 pub struct Call {
-    /// Which CLI produced it: "devin" | "claude" | "codex".
+    /// Which CLI produced it: "devin" | "claude" | "codex" | "grok" | "antigravity".
     pub source: &'static str,
     /// Session identifier within that source.
     pub session: Arc<str>,
     /// Human-readable session name when the source tracks one (claude slug,
-    /// codex first prompt, devin title) — `session` stays the canonical id.
+    /// codex first prompt, devin title, grok summary, antigravity title) —
+    /// `session` stays the canonical id.
     pub session_name: Option<Arc<str>>,
     /// Raw model name as recorded by the CLI.
     pub model: Arc<str>,

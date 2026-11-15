@@ -759,7 +759,7 @@ impl Filter {
 const FIELDS: &[(&str, &str)] = &[
     ("model", "raw model name"),
     ("family", "resolved pricing label"),
-    ("source", "devin | claude | codex"),
+    ("source", "devin | claude | codex | grok | antigravity"),
     ("session", "session id or title"),
     ("date", "call timestamp"),
     ("tokens", "total tokens per call"),
@@ -791,6 +791,8 @@ fn value_candidates(f: Field) -> Vec<(String, &'static str)> {
             ("devin".into(), "Devin CLI"),
             ("claude".into(), "Claude Code"),
             ("codex".into(), "Codex CLI"),
+            ("grok".into(), "Grok Build"),
+            ("antigravity".into(), "Antigravity CLI"),
         ],
         Field::Str(StrField::Model) | Field::Str(StrField::Family) => {
             // Real labels from the user's pricing rules and the built-ins —

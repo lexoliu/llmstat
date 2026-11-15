@@ -11,8 +11,8 @@ use std::time::Instant;
 use anyhow::Context;
 use serde::Deserialize;
 
-use super::proto::{Reader, Value, Writer};
 use super::{ModelEntry, Provider, RunStats};
+use crate::proto::{Reader, Value, Writer};
 
 const BASE: &str = "https://server.codeium.com";
 const GET_USER_JWT: &str = "/exa.auth_pb.AuthService/GetUserJwt";

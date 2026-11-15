@@ -10,6 +10,10 @@
 //!   `projects/**/<sessionId>.jsonl` is tailed.
 //! - Codex: `rollout-*.jsonl` files with a fresh mtime are live; tailed by
 //!   byte offset like the filecache scanner.
+//! - Grok: `summary.json.lock` is an advisory `flock`; `updates.jsonl` is
+//!   tailed by byte offset.
+//! - Antigravity: `presence/<id>.lock` flock; `conversations/<id>.db` `steps`
+//!   rows are tailed by `idx`.
 
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
@@ -153,6 +157,11 @@ fn content_text(v: &serde_json::Value) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
+        serde_json::Value::Object(_) => v
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
         _ => String::new(),
     }
 }
@@ -189,6 +198,11 @@ fn lock_held(path: &Path) -> bool {
     // the fd drop at scope end releases it again immediately.
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     rc != 0
+}
+
+#[cfg(not(unix))]
+fn lock_held(_path: &Path) -> bool {
+    false
 }
 
 /// Is `pid` a live process named like `want` ("claude", "devin")? The name
@@ -1136,6 +1150,437 @@ impl Source for Codex {
     }
 }
 
+// ── Grok: flock on summary.json.lock + updates.jsonl tail ───────────────────
+
+struct GrokTail {
+    offset: u64,
+    sid: String,
+    title: Option<String>,
+}
+
+pub(crate) struct Grok {
+    dir: PathBuf,
+    tails: HashMap<PathBuf, GrokTail>,
+    dead: HashSet<PathBuf>,
+}
+
+impl Grok {
+    pub(crate) fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            tails: HashMap::new(),
+            dead: HashSet::new(),
+        }
+    }
+
+    fn title_of(dir: &Path) -> Option<String> {
+        let text = std::fs::read_to_string(dir.join("summary.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        v.get("generated_title")
+            .or_else(|| v.get("session_summary"))
+            .and_then(|t| t.as_str())
+            .map(crate::sources::titleize)
+            .filter(|t| !t.is_empty())
+    }
+
+    fn events(line: &str) -> Vec<Ev> {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return Vec::new();
+        };
+        let Some(u) = v.get("params").and_then(|p| p.get("update")) else {
+            return Vec::new();
+        };
+        let kind = u
+            .get("sessionUpdate")
+            .and_then(|k| k.as_str())
+            .unwrap_or("");
+        let mut out = Vec::new();
+        match kind {
+            "user_message_chunk" => {
+                let t = u.get("content").map(content_text).unwrap_or_default();
+                if !t.trim().is_empty() && !t.starts_with('<') {
+                    out.push(Ev::Prompt(t));
+                }
+            }
+            "agent_thought_chunk" => {
+                let t = u.get("content").map(content_text).unwrap_or_default();
+                if !t.trim().is_empty() {
+                    out.push(Ev::Think(t));
+                }
+            }
+            "agent_message_chunk" => {
+                let t = u.get("content").map(content_text).unwrap_or_default();
+                if !t.trim().is_empty() {
+                    out.push(Ev::Text(t));
+                }
+            }
+            "tool_call" => {
+                let name = u
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .or_else(|| u.get("kind").and_then(|k| k.as_str()))
+                    .unwrap_or("tool")
+                    .to_string();
+                let detail = u.get("rawInput").map(arg_detail).unwrap_or_default();
+                out.push(Ev::Tool {
+                    name,
+                    detail,
+                    sub: false,
+                });
+            }
+            _ => {}
+        }
+        out
+    }
+}
+
+impl Source for Grok {
+    fn poll(&mut self, out: &mut Vec<FeedMsg>) {
+        for (path, len) in crate::sources::grok::walk(std::slice::from_ref(&self.dir)) {
+            let sess = path.parent().unwrap_or_else(|| Path::new("."));
+            let live = lock_held(&sess.join("summary.json.lock"));
+            if live {
+                self.dead.remove(&path);
+            }
+            if !self.tails.contains_key(&path) {
+                if !live {
+                    continue;
+                }
+                let sid = sess
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.tails.insert(
+                    path.clone(),
+                    GrokTail {
+                        offset: len.saturating_sub(TAIL_BYTES),
+                        sid,
+                        title: Self::title_of(sess),
+                    },
+                );
+            }
+            if !live && self.dead.contains(&path) {
+                continue;
+            }
+            let t = self.tails.get_mut(&path).expect("inserted above");
+            if t.title.is_none() {
+                t.title = Self::title_of(sess);
+            }
+            let mut evts = Vec::new();
+            let _ = crate::sources::filecache::read_lines(
+                &path,
+                t.offset,
+                |s| serde_json::from_str::<serde_json::Value>(s).is_ok(),
+                |line| evts.extend(Self::events(line)),
+            )
+            .map(|new| t.offset = new);
+            if !evts.is_empty() || !live {
+                if !live {
+                    self.dead.insert(path.clone());
+                }
+                out.push(FeedMsg {
+                    src: "grok",
+                    id: t.sid.clone(),
+                    title: t.title.clone(),
+                    live,
+                    evts,
+                    last_ts: crate::sources::filecache::mtime(&path),
+                });
+            }
+        }
+    }
+}
+
+// ── Antigravity: presence/<id>.lock flock + conversations/<id>.db tail ──────
+
+const AGY_USER: i64 = 14;
+const AGY_GEN: i64 = 15;
+const AGY_TOOL: i64 = 132;
+
+struct AgyCursor {
+    next: i64,
+    /// tool call ids already emitted from a generation step.
+    tools: HashSet<String>,
+}
+
+pub(crate) struct Antigravity {
+    root: PathBuf,
+    presence: PathBuf,
+    titles: HashMap<String, String>,
+    curs: HashMap<String, AgyCursor>,
+    dead: HashSet<String>,
+}
+
+impl Antigravity {
+    pub(crate) fn new(root: PathBuf) -> Self {
+        let presence = root.join("presence");
+        Self {
+            root,
+            presence,
+            titles: HashMap::new(),
+            curs: HashMap::new(),
+            dead: HashSet::new(),
+        }
+    }
+
+    fn refresh_titles(&mut self) {
+        let p = self.root.join("conversation_summaries.db");
+        let Ok(conn) = crate::sources::antigravity::open(&p) else {
+            return;
+        };
+        let Ok(mut st) = conn.prepare("SELECT conversation_id, title FROM conversation_summaries")
+        else {
+            return;
+        };
+        let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        else {
+            return;
+        };
+        for r in rows.flatten() {
+            if !r.1.is_empty() {
+                self.titles.insert(r.0, crate::sources::titleize(&r.1));
+            }
+        }
+    }
+
+    fn live_ids(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let Ok(rd) = std::fs::read_dir(&self.presence) else {
+            return out;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_none_or(|x| x != "lock") {
+                continue;
+            }
+            let Some(id) = p.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if lock_held(&p) {
+                out.insert(id);
+            }
+        }
+        out
+    }
+
+    fn db_path(&self, id: &str) -> PathBuf {
+        self.root.join("conversations").join(format!("{id}.db"))
+    }
+
+    fn step_events(cur: &mut AgyCursor, step_type: i64, meta: &[u8], payload: &[u8]) -> Vec<Ev> {
+        use crate::sources::antigravity::string_at;
+        let mut out = Vec::new();
+        match step_type {
+            AGY_USER => {
+                let t = string_at(payload, &[19, 2]).unwrap_or("");
+                if !t.trim().is_empty() && !t.starts_with('<') {
+                    out.push(Ev::Prompt(t.to_string()));
+                }
+            }
+            AGY_GEN => {
+                if let Some(t) = string_at(payload, &[20, 3]).filter(|s| s.len() > 8) {
+                    out.push(Ev::Think(t.to_string()));
+                }
+                let text = string_at(payload, &[20, 1])
+                    .or_else(|| string_at(payload, &[20, 8]))
+                    .unwrap_or("");
+                if !text.trim().is_empty() {
+                    out.push(Ev::Text(text.to_string()));
+                }
+                // 20.7 is repeated: {1: call id, 2: name, 3: json args}
+                for (f, v) in crate::proto::Reader::new(payload) {
+                    if f != 20 {
+                        continue;
+                    }
+                    let crate::proto::Value::Bytes(inner) = v else {
+                        continue;
+                    };
+                    for (f2, v2) in crate::proto::Reader::new(inner) {
+                        if f2 != 7 {
+                            continue;
+                        }
+                        let crate::proto::Value::Bytes(tc) = v2 else {
+                            continue;
+                        };
+                        let mut id = String::new();
+                        let mut name = String::new();
+                        let mut args = serde_json::Value::Null;
+                        for (f3, v3) in crate::proto::Reader::new(tc) {
+                            let crate::proto::Value::Bytes(b) = v3 else {
+                                continue;
+                            };
+                            let Ok(s) = std::str::from_utf8(b) else {
+                                continue;
+                            };
+                            match f3 {
+                                1 => id = s.to_string(),
+                                2 => name = s.to_string(),
+                                3 => {
+                                    args = serde_json::from_str(s)
+                                        .unwrap_or(serde_json::Value::String(s.to_string()))
+                                }
+                                _ => {}
+                            }
+                        }
+                        if name.is_empty() {
+                            continue;
+                        }
+                        if !id.is_empty() && !cur.tools.insert(id) {
+                            continue;
+                        }
+                        out.push(Ev::Tool {
+                            name,
+                            detail: arg_detail(&args),
+                            sub: false,
+                        });
+                    }
+                }
+            }
+            AGY_TOOL => {
+                let name = string_at(meta, &[4, 2]).unwrap_or("");
+                if name.is_empty() {
+                    return out;
+                }
+                let id = string_at(meta, &[4, 1]).unwrap_or("");
+                if !id.is_empty() && !cur.tools.insert(id.to_string()) {
+                    return out;
+                }
+                let args = string_at(meta, &[4, 3])
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                out.push(Ev::Tool {
+                    name: name.to_string(),
+                    detail: arg_detail(&args),
+                    sub: false,
+                });
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn attach(&self, id: &str) -> Result<(AgyCursor, Vec<(i64, i64, Vec<u8>, Vec<u8>)>)> {
+        let conn = crate::sources::antigravity::open(&self.db_path(id))?;
+        let mut st = conn.prepare(
+            "SELECT idx, step_type, metadata, step_payload FROM steps ORDER BY idx DESC LIMIT ?1",
+        )?;
+        let mut rows: Vec<(i64, i64, Vec<u8>, Vec<u8>)> = st
+            .query_map([BACKFILL], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
+                    r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.reverse();
+        let next = match rows.last() {
+            Some((idx, _, _, _)) => idx + 1,
+            None => 0,
+        };
+        Ok((
+            AgyCursor {
+                next,
+                tools: HashSet::new(),
+            },
+            rows,
+        ))
+    }
+
+    fn tail(db: &Path, cur: &mut AgyCursor) -> Result<Vec<(i64, i64, Vec<u8>, Vec<u8>)>> {
+        let conn = crate::sources::antigravity::open(db)?;
+        let mut st = conn.prepare(
+            "SELECT idx, step_type, metadata, step_payload FROM steps \
+             WHERE idx >= ?1 ORDER BY idx LIMIT 2000",
+        )?;
+        let rows = st
+            .query_map([cur.next], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
+                    r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if let Some((idx, _, _, _)) = rows.last() {
+            cur.next = idx + 1;
+        }
+        Ok(rows)
+    }
+}
+
+impl Source for Antigravity {
+    fn poll(&mut self, out: &mut Vec<FeedMsg>) {
+        self.refresh_titles();
+        let live = self.live_ids();
+        for id in &live {
+            self.dead.remove(id);
+            if self.curs.contains_key(id.as_str()) {
+                continue;
+            }
+            match self.attach(id) {
+                Ok((mut cur, rows)) => {
+                    let mut evts = Vec::new();
+                    let mut last_ts = 0i64;
+                    for (idx, st, meta, payload) in &rows {
+                        last_ts = *idx;
+                        evts.extend(Self::step_events(&mut cur, *st, meta, payload));
+                    }
+                    out.push(FeedMsg {
+                        src: "antigravity",
+                        id: id.clone(),
+                        title: self.titles.get(id).cloned(),
+                        live: true,
+                        evts,
+                        last_ts,
+                    });
+                    self.curs.insert(id.clone(), cur);
+                }
+                Err(e) => tracing::warn!("antigravity tail attach {id}: {e:#}"),
+            }
+        }
+        let ids: Vec<String> = self.curs.keys().cloned().collect();
+        for id in ids {
+            let still = live.contains(&id);
+            if !still && self.dead.contains(&id) {
+                continue;
+            }
+            let mut evts = Vec::new();
+            let mut last_ts = 0i64;
+            let db = self.db_path(&id);
+            let res = {
+                let cur = self.curs.get_mut(&id).expect("iterating keys");
+                Self::tail(&db, cur)
+            };
+            match res {
+                Ok(rows) => {
+                    let cur = self.curs.get_mut(&id).expect("still present");
+                    for (idx, st, meta, payload) in &rows {
+                        last_ts = *idx;
+                        evts.extend(Self::step_events(cur, *st, meta, payload));
+                    }
+                }
+                Err(e) => tracing::warn!("antigravity tail {id}: {e:#}"),
+            }
+            if !evts.is_empty() || !still {
+                if !still {
+                    self.dead.insert(id.clone());
+                }
+                out.push(FeedMsg {
+                    src: "antigravity",
+                    id: id.clone(),
+                    title: self.titles.get(&id).cloned(),
+                    live: still,
+                    evts,
+                    last_ts,
+                });
+            }
+        }
+    }
+}
+
 // ── pane + grid TUI ─────────────────────────────────────────────────────────
 
 /// `s` as styled lines: first line gets `first` as prefix, the rest `rest`;
@@ -1298,6 +1743,9 @@ fn color_of(source: &str) -> Color {
     match source {
         "devin" => Color::Cyan,
         "claude" => Color::Yellow,
+        "codex" => Color::Magenta,
+        "grok" => Color::Blue,
+        "antigravity" => Color::Green,
         _ => Color::Magenta,
     }
 }

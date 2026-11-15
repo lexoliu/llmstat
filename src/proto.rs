@@ -1,6 +1,8 @@
-//! Minimal protobuf wire encoder/decoder for the Devin Connect-RPC calls.
-//! Only the field shapes llmstat actually sends are built; the reader walks
-//! arbitrary messages so response parsing can pick the fields it needs.
+//! Minimal protobuf wire encoder/decoder.
+//!
+//! Speedtest builds the Devin Connect-RPC request shapes; the reader walks
+//! arbitrary messages so response parsing and the Antigravity usage source
+//! can pick the fields they need.
 
 /// Wire types.
 const VARINT: u8 = 0;
