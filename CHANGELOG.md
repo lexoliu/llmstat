@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/lexoliu/llmstat/compare/v0.2.3...v0.2.4) - 2026-11-15
+
+### Added
+
+- grok and antigravity usage sources ([#66](https://github.com/lexoliu/llmstat/pull/66))
+- serve — headless JSON snapshot of live stats ([#62](https://github.com/lexoliu/llmstat/pull/62))
+- host mirrors + `llmstat sync` — count other machines' usage ([#61](https://github.com/lexoliu/llmstat/pull/61))
+- watch — tiled read-only tails of every running agent ([#60](https://github.com/lexoliu/llmstat/pull/60))
+- shell completions — dynamic + static script
+- --filter/-f expression filter over calls
+
+### Fixed
+
+- *(speedtest)* count antigravity thinking in TTFT, not decode tok/s ([#56](https://github.com/lexoliu/llmstat/pull/56))
+
+### Other
+
+- open the release-plz PR after Test on main
+- release from main and retire dev
+- attest release artifacts with build provenance
+- drop the x86_64-apple-darwin release target
+- *(changelog)* drop hand-written Unreleased entries
+
 ### Added
 
 - `llmstat sync <host>`: mirror another machine's usage data over ssh into
