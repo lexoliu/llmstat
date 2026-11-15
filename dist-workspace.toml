@@ -22,3 +22,8 @@ github-attestations = true
 # committed one — future `dist generate` runs must have their changes
 # merged in manually.
 allow-dirty = ["ci"]
+
+# GitHub retired macos-14 on 2 November 2026. cargo-dist 0.33 still selects
+# it for aarch64-apple-darwin.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
