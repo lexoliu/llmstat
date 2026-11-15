@@ -10,6 +10,8 @@
 # * publish-crate also runs on workflow_dispatch (trusted publishing is bound
 #   to this workflow file).
 # * CUSTOM JOB publish-crate (crates.io OIDC) — re-add after `dist generate`.
+# * host's `gh release create --target` uses `git rev-parse HEAD`. `inputs.tag`
+#   is a tag name; GitHub 422s that as target_commitish.
 #
 # Copyright 2022-2024, axodotdev
 # SPDX-License-Identifier: MIT or Apache-2.0
@@ -340,11 +342,12 @@ jobs:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
-          RELEASE_COMMIT: "${{ inputs.tag || github.sha }}"
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
+          # --target needs a commit SHA. This job already checked out the tag.
+          RELEASE_COMMIT=$(git rev-parse HEAD)
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   announce:
