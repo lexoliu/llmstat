@@ -2,7 +2,7 @@ name: release-plz
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
 
 jobs:
   # Pushes git tag v{version} when Cargo.toml's version is unpublished.
@@ -11,7 +11,6 @@ jobs:
   # trusted publishing plus the cargo-dist binary builds — one atomic run.
   release:
     name: tag release
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -26,11 +25,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
 
-  # Keeps a version-bump + changelog PR open against dev; version truth
-  # stays on the development branch.
+  # Keeps a version-bump + changelog PR open against main.
   release-pr:
     name: release PR
-    if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     permissions:
       contents: write
