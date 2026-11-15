@@ -3,7 +3,6 @@
 
 mod antigravity;
 mod devin;
-mod proto;
 
 use std::time::Duration;
 

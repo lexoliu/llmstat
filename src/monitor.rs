@@ -262,6 +262,9 @@ fn color_of(source: &str) -> Color {
     match source {
         "devin" => Color::Cyan,
         "claude" => Color::Yellow,
+        "codex" => Color::Magenta,
+        "grok" => Color::Blue,
+        "antigravity" => Color::Green,
         _ => Color::Magenta,
     }
 }
@@ -295,7 +298,7 @@ impl Dir {
 }
 
 const COLS: [(Col, &str, Constraint); 8] = [
-    (Col::Src, "SRC", Constraint::Length(7)),
+    (Col::Src, "SRC", Constraint::Length(13)),
     (Col::Session, "SESSION", Constraint::Min(20)),
     (Col::Model, "MODEL", Constraint::Length(18)),
     (Col::Tokens, "TOKENS", Constraint::Length(10)),
@@ -472,7 +475,9 @@ fn draw(
     // ── rolling rate chart ────────────────────────────────────────────
     let mut data = Vec::new();
     let mut ymax = 1.0f64;
-    for s in ["devin", "claude", "codex"] {
+    let mut names: Vec<&'static str> = st.series.keys().copied().collect();
+    names.sort();
+    for s in names {
         if let Some(r) = st.series.get(s) {
             let pts = r.series(now);
             ymax = pts.iter().map(|p| p.1).fold(ymax, f64::max);

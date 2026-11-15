@@ -229,6 +229,35 @@ pub(crate) fn default_rules() -> Vec<Rule> {
             price: None,
         },
         r("glm-5", "GLM-5", true, Some("glm-5"), 1.40, 0.26, 4.40),
+        // --- Grok Build (`grok-4.6-build` does not prefix-match xai/grok-4.6) ---
+        r(
+            "grok-4-6",
+            "Grok 4.6",
+            false,
+            Some("xai/grok-4.6"),
+            2.00,
+            0.50,
+            6.00,
+        ),
+        r(
+            "grok-4-7",
+            "Grok 4.7",
+            false,
+            Some("xai/grok-4.7"),
+            2.00,
+            0.50,
+            6.00,
+        ),
+        // --- Antigravity trial ids LiteLLM lists under gemini/ ---
+        r(
+            "gemini-4-argon",
+            "Gemini 4 Argon",
+            false,
+            Some("gemini/gemini-4-argon"),
+            2.00,
+            0.10,
+            10.00,
+        ),
     ]
 }
 

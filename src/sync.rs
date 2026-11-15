@@ -8,6 +8,9 @@
 //! claude/**/*.jsonl           ← ~/.claude/projects/
 //! codex/sessions/**           ← ~/.codex/sessions/
 //! codex/archived_sessions/**  ← ~/.codex/archived_sessions/
+//! grok/**/{updates.jsonl,summary.json} ← ~/.grok/sessions/
+//! antigravity/conversations/*.db       ← sqlite .backup of ~/.gemini/antigravity-cli/conversations/
+//! antigravity/conversation_summaries.db ← sqlite .backup of conversation_summaries.db
 //! ```
 //!
 //! Reports and live modes pick up every mirrored host automatically — the
@@ -89,6 +92,13 @@ const TREES: &[Part] = &[
 const DB_REMOTE: &str = ".local/share/devin/cli/sessions.db";
 const DB_LOCAL: &str = "devin/sessions.db";
 
+const GROK_REMOTE: &str = ".grok/sessions";
+const GROK_LOCAL: &str = "grok";
+
+const AGY_CONV_REMOTE: &str = ".gemini/antigravity-cli/conversations";
+const AGY_SUM_REMOTE: &str = ".gemini/antigravity-cli/conversation_summaries.db";
+const AGY_LOCAL: &str = "antigravity";
+
 /// Run `script` on `host` through `bash -s` over ssh — stdin delivery keeps
 /// the login shell (fish, anything) out of the quoting business entirely.
 fn ssh_script(host: &str, script: &str) -> Result<Output> {
@@ -118,7 +128,12 @@ fn probe(host: &str) -> Result<Vec<String>> {
     let paths: Vec<String> = TREES
         .iter()
         .map(|p| format!("$HOME/{}", p.remote))
-        .chain(std::iter::once(format!("$HOME/{DB_REMOTE}")))
+        .chain([
+            format!("$HOME/{DB_REMOTE}"),
+            format!("$HOME/{GROK_REMOTE}"),
+            format!("$HOME/{AGY_CONV_REMOTE}"),
+            format!("$HOME/{AGY_SUM_REMOTE}"),
+        ])
         .collect();
     let script = format!(
         "for p in {}; do [ -e \"$p\" ] && echo \"HAVE:$p\"; done",
@@ -190,6 +205,78 @@ fn pull_db(host: &str, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Grok sessions: only the files the source reads (`updates.jsonl` and
+/// `summary.json`). `usage.json` is rewritten in place and ignored.
+fn pull_grok(host: &str, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    let status = Command::new("rsync")
+        .arg("-a")
+        .arg("--delete")
+        .arg("--timeout=120")
+        .arg("--include=*/")
+        .arg("--include=updates.jsonl")
+        .arg("--include=summary.json")
+        .arg("--exclude=*")
+        .arg(format!("{host}:{GROK_REMOTE}/"))
+        .arg(dst)
+        .stderr(Stdio::piped())
+        .status()
+        .context("rsync failed to start")?;
+    if !status.success() {
+        bail!("rsync {host}:{GROK_REMOTE} exited {status}");
+    }
+    Ok(())
+}
+
+/// Consistent snapshots of every Antigravity conversation db plus the
+/// summaries db, via sqlite's backup API.
+fn pull_agy(host: &str, dst: &Path) -> Result<()> {
+    let tmp = ".cache/llmstat-agy";
+    let backup = ssh_script(
+        host,
+        &format!(
+            r#"set -e
+mkdir -p "$HOME/{tmp}/conversations"
+rm -rf "$HOME/{tmp}/conversations"/*
+rm -f "$HOME/{tmp}/conversation_summaries.db"
+if [ -d "$HOME/{AGY_CONV_REMOTE}" ]; then
+  for f in "$HOME/{AGY_CONV_REMOTE}"/*.db; do
+    [ -f "$f" ] || continue
+    sqlite3 "$f" ".backup $HOME/{tmp}/conversations/$(basename "$f")"
+  done
+fi
+if [ -f "$HOME/{AGY_SUM_REMOTE}" ]; then
+  sqlite3 "$HOME/{AGY_SUM_REMOTE}" ".backup $HOME/{tmp}/conversation_summaries.db"
+fi
+"#
+        ),
+    )
+    .context("ssh antigravity backup failed to start")?;
+    if !backup.status.success() {
+        bail!(
+            "remote antigravity sqlite backup failed: {}",
+            String::from_utf8_lossy(&backup.stderr).trim()
+        );
+    }
+    std::fs::create_dir_all(dst)?;
+    let pull = Command::new("rsync")
+        .arg("-a")
+        .arg("--delete")
+        .arg(format!("{host}:{tmp}/"))
+        .arg(dst)
+        .stderr(Stdio::piped())
+        .output()
+        .context("rsync failed to start")?;
+    let _ = ssh_script(host, &format!("rm -rf \"$HOME/{tmp}\""));
+    if !pull.status.success() {
+        bail!(
+            "rsync of antigravity dbs failed: {}",
+            String::from_utf8_lossy(&pull.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Files + total bytes under `dir`, for the summary line.
 fn dir_size(dir: &Path) -> (usize, u64) {
     let mut files = 0;
@@ -245,6 +332,25 @@ pub fn run(host: &str) -> Result<()> {
             ));
         } else {
             println!("{:<20} not on {host}", "devin/sessions.db");
+        }
+        if present.iter().any(|p| p.ends_with(GROK_REMOTE)) {
+            let dst = root.join(GROK_LOCAL);
+            jobs.push(("grok", dst.clone(), s.spawn(move || pull_grok(host, &dst))));
+        } else {
+            println!("{:<20} not on {host}", "grok");
+        }
+        if present
+            .iter()
+            .any(|p| p.ends_with(AGY_CONV_REMOTE) || p.ends_with(AGY_SUM_REMOTE))
+        {
+            let dst = root.join(AGY_LOCAL);
+            jobs.push((
+                "antigravity",
+                dst.clone(),
+                s.spawn(move || pull_agy(host, &dst)),
+            ));
+        } else {
+            println!("{:<20} not on {host}", "antigravity");
         }
 
         let mut failed = 0;

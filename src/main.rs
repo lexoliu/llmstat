@@ -3,6 +3,7 @@ mod filter;
 mod fmt;
 mod monitor;
 mod pricing;
+mod proto;
 mod render;
 mod report;
 mod serve;
@@ -26,7 +27,7 @@ use crate::report::BucketKind;
 use crate::sources::SourceOut;
 
 /// Token usage distribution and cost across local LLM CLIs
-/// (Devin, Claude Code, Codex).
+/// (Devin, Claude Code, Codex, Grok Build, Antigravity).
 #[derive(Parser)]
 #[command(name = "llmstat", version, about)]
 struct Args {
@@ -38,8 +39,8 @@ struct Args {
     #[arg(
         long,
         value_delimiter = ',',
-        value_name = "devin,claude,codex",
-        value_parser = clap::builder::PossibleValuesParser::new(["devin", "claude", "codex"]),
+        value_name = "devin,claude,codex,grok,antigravity",
+        value_parser = clap::builder::PossibleValuesParser::new(["devin", "claude", "codex", "grok", "antigravity"]),
         global = true
     )]
     sources: Vec<String>,
@@ -68,6 +69,16 @@ struct Args {
     /// codex source.
     #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
     codex_dir: Option<PathBuf>,
+
+    /// Grok sessions directory (~/.grok/sessions). Suppresses synced
+    /// host-mirror data for the grok source.
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
+    grok_dir: Option<PathBuf>,
+
+    /// Antigravity CLI root (~/.gemini/antigravity-cli). Suppresses synced
+    /// host-mirror data for the antigravity source.
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, global = true)]
+    antigravity_dir: Option<PathBuf>,
 
     /// TOML file with extra [[rule]] pricing entries (takes precedence over
     /// LiteLLM and built-ins).
@@ -202,6 +213,10 @@ struct Sources {
     /// Codex session dirs — the local pair first, then host `codex/`
     /// mirrors' session dirs.
     codex_dirs: Vec<PathBuf>,
+    /// Grok sessions dirs — local first, then host `grok/` mirrors.
+    grok_dirs: Vec<PathBuf>,
+    /// Antigravity CLI roots — local first, then host `antigravity/` mirrors.
+    antigravity_dirs: Vec<PathBuf>,
     /// Hosts whose mirrors contributed at least one path, for the coverage
     /// line. Each maps to the sources it feeds.
     hosts: Vec<(String, Vec<&'static str>)>,
@@ -217,7 +232,7 @@ fn resolve_sources(args: &Args) -> anyhow::Result<Sources> {
             .map(|s| s.trim().to_lowercase())
             .collect()
     } else {
-        ["devin", "claude", "codex"]
+        ["devin", "claude", "codex", "grok", "antigravity"]
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -247,6 +262,16 @@ fn resolve_sources(args: &Args) -> anyhow::Result<Sources> {
             .join(".codex")
     });
     let mut codex_dirs = sources::codex::dirs_for(&codex_root);
+    let mut grok_dirs = vec![
+        args.grok_dir
+            .clone()
+            .unwrap_or_else(sources::grok::default_dir),
+    ];
+    let mut antigravity_dirs = vec![
+        args.antigravity_dir
+            .clone()
+            .unwrap_or_else(sources::antigravity::default_dir),
+    ];
 
     // Synced host mirrors feed the same sources. An explicit --*-dir /
     // --devin-db flag relocates that source's local data — it suppresses
@@ -288,6 +313,20 @@ fn resolve_sources(args: &Args) -> anyhow::Result<Sources> {
                 fed.push("codex");
             }
         }
+        if args.grok_dir.is_none() {
+            let g = root.join("grok");
+            if g.is_dir() {
+                grok_dirs.push(g);
+                fed.push("grok");
+            }
+        }
+        if args.antigravity_dir.is_none() {
+            let a = root.join("antigravity");
+            if a.is_dir() {
+                antigravity_dirs.push(a);
+                fed.push("antigravity");
+            }
+        }
         if !fed.is_empty() {
             hosts.push((name, fed));
         }
@@ -300,6 +339,8 @@ fn resolve_sources(args: &Args) -> anyhow::Result<Sources> {
         claude_dirs,
         codex_root,
         codex_dirs,
+        grok_dirs,
+        antigravity_dirs,
         hosts,
     })
 }
@@ -352,6 +393,20 @@ fn open_scanners(src: &Sources) -> anyhow::Result<Vec<sources::AnyScanner>> {
     }
     if src.wanted.contains("codex") && (src.codex_dirs.iter().any(|d| d.exists()) || src.explicit) {
         scanners.push(sources::AnyScanner::codex(src.codex_dirs.clone()));
+    }
+    if src.wanted.contains("grok") && (src.grok_dirs.iter().any(|d| d.exists()) || src.explicit) {
+        scanners.push(sources::AnyScanner::grok(src.grok_dirs.clone()));
+    }
+    if src.wanted.contains("antigravity")
+        && (src
+            .antigravity_dirs
+            .iter()
+            .any(|d| d.join("conversations").is_dir())
+            || src.explicit)
+    {
+        scanners.push(sources::AnyScanner::antigravity(
+            src.antigravity_dirs.clone(),
+        )?);
     }
     if scanners.is_empty() {
         anyhow::bail!("no usage data sources found");
@@ -472,6 +527,16 @@ fn run_watch(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
     if src.wanted.contains("codex") && (local_codex.iter().any(|d| d.exists()) || src.explicit) {
         feeds.push(Box::new(watch::Codex::new(local_codex, &src.codex_root)));
     }
+    let grok_dir = &src.grok_dirs[0];
+    if src.wanted.contains("grok") && (grok_dir.exists() || src.explicit) {
+        feeds.push(Box::new(watch::Grok::new(grok_dir.clone())));
+    }
+    let agy_dir = &src.antigravity_dirs[0];
+    if src.wanted.contains("antigravity")
+        && (agy_dir.join("conversations").is_dir() || src.explicit)
+    {
+        feeds.push(Box::new(watch::Antigravity::new(agy_dir.clone())));
+    }
     if feeds.is_empty() {
         anyhow::bail!("no live-agent sources found");
     }
@@ -567,7 +632,7 @@ fn main() -> anyhow::Result<()> {
     let src = resolve_sources(&args)?;
     let (wanted, explicit) = (&src.wanted, src.explicit);
 
-    // The three scans are independent — run them concurrently under one
+    // The scans are independent — run them concurrently under one
     // MultiProgress so their progress bars stack instead of clobbering.
     let mp = MultiProgress::new();
     type Job<'a> = (
@@ -585,9 +650,15 @@ fn main() -> anyhow::Result<()> {
             .collect();
         let claude_dirs = src.claude_dirs.clone();
         let codex_dirs = src.codex_dirs.clone();
+        let grok_dirs = src.grok_dirs.clone();
+        let antigravity_dirs = src.antigravity_dirs.clone();
         let codex_present = codex_dirs.iter().any(|d| d.exists());
         let devin_present = devin_dirs.iter().any(|d| d.exists()) || !devin_dbs.is_empty();
         let claude_present = claude_dirs.iter().any(|d| d.exists());
+        let grok_present = grok_dirs.iter().any(|d| d.exists());
+        let agy_present = antigravity_dirs
+            .iter()
+            .any(|d| d.join("conversations").is_dir());
         let mp = &mp;
         vec![
             (
@@ -604,6 +675,16 @@ fn main() -> anyhow::Result<()> {
                 "codex",
                 codex_present,
                 Box::new(move || sources::codex::load(&codex_dirs, mp)) as _,
+            ),
+            (
+                "grok",
+                grok_present,
+                Box::new(move || sources::grok::load(&grok_dirs, mp)) as _,
+            ),
+            (
+                "antigravity",
+                agy_present,
+                Box::new(move || sources::antigravity::load(&antigravity_dirs, mp)) as _,
             ),
         ]
     };
