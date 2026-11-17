@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/lexoliu/llmstat/compare/v0.2.4...v0.2.5) - 2026-11-17
+
+### Fixed
+
+- resolve Gemini 4 pricing and Antigravity model identification ([#77](https://github.com/lexoliu/llmstat/pull/77)) ([#78](https://github.com/lexoliu/llmstat/pull/78))
+
+### Other
+
+- pass a commit SHA to gh release create --target
+- build aarch64-apple-darwin on macos-15
+
 ## [0.2.4](https://github.com/lexoliu/llmstat/compare/v0.2.3...v0.2.4) - 2026-11-15
 
 ### Added
