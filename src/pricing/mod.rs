@@ -248,7 +248,7 @@ pub(crate) fn default_rules() -> Vec<Rule> {
             0.50,
             6.00,
         ),
-        // --- Antigravity trial ids LiteLLM lists under gemini/ ---
+        // --- Antigravity / Gemini 4 ids LiteLLM lists under gemini/ ---
         r(
             "gemini-4-argon",
             "Gemini 4 Argon",
@@ -257,6 +257,98 @@ pub(crate) fn default_rules() -> Vec<Rule> {
             2.00,
             0.10,
             10.00,
+        ),
+        r(
+            "gemini-4-carbon",
+            "Gemini 4 Carbon",
+            false,
+            Some("gemini/gemini-4-carbon"),
+            2.00,
+            0.10,
+            10.00,
+        ),
+        r(
+            "gemini-4-hydrogen",
+            "Gemini 4 Hydrogen",
+            false,
+            Some("gemini/gemini-4-hydrogen"),
+            1.50,
+            0.075,
+            7.50,
+        ),
+        // --- Antigravity orchestrator/worker routing ids ---
+        r(
+            "gemini-pro-orchestrator-g1-pro",
+            "Gemini 4 Argon",
+            false,
+            Some("gemini/gemini-4-argon"),
+            2.00,
+            0.10,
+            10.00,
+        ),
+        r(
+            "orchestrator-argon",
+            "Gemini 4 Argon",
+            false,
+            Some("gemini/gemini-4-argon"),
+            2.00,
+            0.10,
+            10.00,
+        ),
+        r(
+            "gemini-pro-orchestrator",
+            "Gemini 4 Carbon",
+            false,
+            Some("gemini/gemini-4-carbon"),
+            2.00,
+            0.10,
+            10.00,
+        ),
+        r(
+            "orchestrator-carbon",
+            "Gemini 4 Carbon",
+            false,
+            Some("gemini/gemini-4-carbon"),
+            2.00,
+            0.10,
+            10.00,
+        ),
+        r(
+            "gemini-flash-worker-agy",
+            "Gemini 4 Hydrogen",
+            false,
+            Some("gemini/gemini-4-hydrogen"),
+            1.50,
+            0.075,
+            7.50,
+        ),
+        // --- Gemini 3.8 Flash tier variants ---
+        r(
+            "gemini-3-8-flash-cyber",
+            "Gemini 3.8 Flash Cyber",
+            false,
+            Some("gemini-3.8-flash-cyber"),
+            1.50,
+            0.15,
+            7.50,
+        ),
+        r(
+            "gemini-3-8-flash",
+            "Gemini 3.8 Flash",
+            false,
+            Some("gemini-3.8-flash"),
+            0.75,
+            0.075,
+            3.75,
+        ),
+        r(
+            "gemini-3-5-flash-lite",
+            "Gemini 3.5 Flash Lite",
+            false,
+            Some("gemini-3.5-flash-lite"),
+            0.30,
+            0.03,
+            2.50,
         ),
     ]
 }
@@ -357,5 +449,32 @@ pub fn load_default_config() -> (Vec<Rule>, crate::energy::Energy) {
         load_config(&p).unwrap_or_default()
     } else {
         Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_gemini_4_and_antigravity_aliases() {
+        let book = PriceBook::new(Vec::new(), LiteBook::load(false));
+        for (raw, expected_label) in [
+            ("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+            ("gemini-4-carbon", "Gemini 4 Carbon"),
+            ("gemini-4-argon-trial", "Gemini 4 Argon"),
+            ("gemini-pro-orchestrator", "Gemini 4 Carbon"),
+            ("gemini-pro-orchestrator-g1-pro", "Gemini 4 Argon"),
+            ("gemini-flash-worker-agy", "Gemini 4 Hydrogen"),
+            ("Gemini 4 Carbon (Medium)", "Gemini 4 Carbon"),
+            ("Orchestrator (Argon)", "Gemini 4 Argon"),
+            ("gemini-3.8-flash-n", "Gemini 3.8 Flash"),
+            ("gemini-3.8-flash-tiered", "Gemini 3.8 Flash"),
+        ] {
+            let r = book.resolve(raw);
+            assert_eq!(r.label, expected_label, "raw={raw}");
+            assert!(r.price.is_some(), "missing price for {raw}");
+            assert!(matches!(r.pricing, Pricing::Paid), "raw={raw}");
+        }
     }
 }

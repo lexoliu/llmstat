@@ -21,7 +21,7 @@ use crate::report::{Call, Usage};
 use crate::sources::SourceOut;
 
 const SOURCE: &str = "antigravity";
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 /// Assistant generation step — one per `gen_metadata` row, in order.
 const STEP_GENERATION: i64 = 15;
 
@@ -101,10 +101,12 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
         .with_context(|| format!("cannot open {}", path.display()))
 }
 
-/// Decode `gen_metadata.data`: usage at `1.4.{2,3,5}`, model at `1.19`.
+/// Decode `gen_metadata.data`: usage at `1.4.{2,3,5}`, model at `1.19`
+/// (falling back to the display label at `1.21` when `1.19` is empty).
 pub(crate) fn decode_gen(data: &[u8]) -> Option<(Usage, String)> {
     let mut usage_msg: Option<&[u8]> = None;
     let mut model = String::new();
+    let mut display_model = String::new();
     for (f, v) in Reader::new(data) {
         if f != 1 {
             continue;
@@ -120,10 +122,20 @@ pub(crate) fn decode_gen(data: &[u8]) -> Option<(Usage, String)> {
                         model = s.to_string();
                     }
                 }
+                (21, Value::Bytes(m)) => {
+                    if let Ok(s) = std::str::from_utf8(m)
+                        && !s.is_empty()
+                    {
+                        display_model = s.to_string();
+                    }
+                }
                 _ => {}
             }
         }
         break;
+    }
+    if model.is_empty() {
+        model = display_model;
     }
     let u = usage_msg?;
     let mut input = 0u64;
@@ -603,5 +615,22 @@ mod tests {
         assert_eq!(calls[1].usage.output, 81);
         assert_eq!(calls[1].model.as_ref(), "gemini-3.8-flash-tiered");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn decode_gen_falls_back_to_display_model() {
+        let mut usage = Writer::new();
+        usage.varint_field(2, 100);
+        usage.varint_field(3, 25);
+        let mut inner = Writer::new();
+        inner.message(4, &usage);
+        inner.string(21, "Gemini 4 Carbon (Medium)");
+        let mut top = Writer::new();
+        top.message(1, &inner);
+
+        let (u, model) = decode_gen(&top.into_vec()).unwrap();
+        assert_eq!(u.input, 100);
+        assert_eq!(u.output, 25);
+        assert_eq!(model, "Gemini 4 Carbon (Medium)");
     }
 }
