@@ -99,6 +99,15 @@ impl LiteBook {
     /// the per-1M-token price. Exact match first, then the longest key that
     /// prefixes the model name or vice versa (dated aliases etc.).
     pub fn lookup(&self, normalized_name: &str) -> Option<(String, Price)> {
+        self.lookup_one(normalized_name).or_else(|| {
+            normalized_name
+                .starts_with("gemini-")
+                .then(|| self.lookup_one(&format!("gemini-{normalized_name}")))
+                .flatten()
+        })
+    }
+
+    fn lookup_one(&self, normalized_name: &str) -> Option<(String, Price)> {
         let to_price = |e: &LiteEntry| Price {
             input: e.input_cost_per_token.unwrap_or(0.0) * 1e6,
             // no cache-read price listed -> cached bills at input rate
@@ -129,5 +138,32 @@ impl LiteBook {
             }
         }
         best.map(|(k, e)| (k.clone(), to_price(e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_falls_back_to_gemini_provider_prefix() {
+        let map = parse(
+            r#"{
+                "gemini/gemini-4-hydrogen": {
+                    "input_cost_per_token": 1.5e-6,
+                    "cache_read_input_token_cost": 7.5e-8,
+                    "output_cost_per_token": 7.5e-6
+                }
+            }"#,
+        );
+        let book = LiteBook {
+            map,
+            note: "test".into(),
+        };
+        let (key, price) = book.lookup("gemini-4-hydrogen").unwrap();
+        assert_eq!(key, "gemini-gemini-4-hydrogen");
+        assert!((price.input - 1.5).abs() < 1e-9);
+        assert!((price.cached - 0.075).abs() < 1e-9);
+        assert!((price.output - 7.5).abs() < 1e-9);
     }
 }
